@@ -2,85 +2,192 @@
 """LoRA 蒸馏训练：用线上 teacher 输出做 SFT，产出可直接被 vLLM 托管的合并权重。
 
 数据：{prompt, output} 的 JSONL（prompt 已是线上渲染好的完整输入，无 system prompt）。
-目标是"给定 prompt 产出六字段 JSON"，因此：
+目标是「给定 prompt 产出六字段 JSON」，因此：
 - 走 chat 模板拼成 user/assistant 两段，**只在 assistant 段算 loss**（train_on_responses_only），
   避免把算力浪费在复述超长 prompt 上；
 - 训练后默认合并权重落盘（save_pretrained_merged），评测端直接用 vLLM 起服务，
-  不必依赖 vLLM 对该混合架构的 LoRA 支持。
+  不必依赖 vLLM 对该混合架构的 LoRA 支持；
+- 训练结束自动在留出集上跑一次真实评测（生成 + 复用仓库评分器），
+  避免只看 loss 就交付（loss 低但结构化输出崩掉是 SFT 的典型失败模式）。
+
+关键配置的依据（按论文/实践选型）：
+- **NEFTune**（Jain et al., ICLR 2024, arXiv:2310.05914）：训练时给 embedding 加噪，
+  指令跟随显著提升（LLaMA-2-7B AlpacaEval 胜率 29.79% → 64.69%）；7B 量级推荐 α=5。
+- **rsLoRA**（Kalajdzievski, 2023）：秩稳定缩放，rank ≥ 16 时比经典 LoRA 更稳。
+- **cosine + warmup**：长序列 SFT 的标准调度，比 linear 更平滑（配合单 epoch）。
+- **宽覆盖 target modules**（Qwen 系默认 q/k/v/o/gate/up/down 全线性层）：
+  "LoRA Learns Less and Forgets Less"(TMLR 2024) 指出领域适配需要更宽的适配面。
+- **长度过滤而非静默截断**：被截断到看不见答案的样本一律剔除并记录，
+  避免全 -100 标签引发的 NaN/无效样本（max_seq_len 从 8192 提到 12288，剔除率 8% → ~1%）。
+- **batch × 累积 + group_by_length**：按长度分桶减少 padding 浪费。
 
 依赖：.venv-train（unsloth + trl + peft + transformers<=5.5.0，复用系统 torch）。
 用法：
   .venv-train/bin/python scripts/train_lora.py \
       --model Qwen/Qwen3.5-2B --train-file data/train_lora_2k.jsonl \
-      --out-dir models/lora_2b --merged-dir models/merged_2b \
-      --epochs 1 --max-seq-len 8192
+      --eval-file data/eval_holdout_100.jsonl --eval-limit 30 \
+      --out-dir models/lora_2b --merged-dir models/merged_2b --epochs 1
 """
 from __future__ import annotations
 
 import argparse
 import inspect
 import json
+import sys
 import time
+from pathlib import Path
+
+# 允许直接 `python scripts/train_lora.py` 运行：把仓库根加入 sys.path（供训练后评测复用 app 评分器）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LoRA 蒸馏训练（Unsloth + trl）")
+    # 数据与产物
     p.add_argument("--model", default="Qwen/Qwen3.5-2B")
     p.add_argument("--train-file", default="data/train_lora_2k.jsonl")
     p.add_argument("--out-dir", default="models/lora_run")
     p.add_argument("--merged-dir", default=None, help="给定则训练后合并权重落盘（供 vLLM 直接加载）")
-    p.add_argument("--limit", type=int, default=0, help="只用前 N 条（0=全部），便于先跑小样")
+    p.add_argument("--limit", type=int, default=0, help="只用前 N 条（0=全部）")
+    # 训练超参
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help=">0 时覆盖 epochs（冒烟测试用）")
-    p.add_argument("--max-seq-len", type=int, default=8192)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--max-seq-len", type=int, default=12288)
+    p.add_argument("--lr", type=float, default=2e-4, help="LoRA 可比全参微调高一个量级")
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--neftune-alpha", type=float, default=5.0,
+                   help="NEFTune embedding 噪声强度（ICLR 2024；0=关闭）")
+    p.add_argument("--lr-scheduler", default="cosine")
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--group-by-length", action="store_true", default=True,
+                   help="按长度分桶，减少 batch 内 padding 浪费")
+    p.add_argument("--no-group-by-length", dest="group_by_length", action="store_false")
     p.add_argument("--save-steps", type=int, default=200)
     p.add_argument("--logging-steps", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
+    # 训练后留出集快速评测（生成 + 复用仓库评分器）
+    p.add_argument("--eval-file", default=None, help="留出集 JSONL（不传则跳过训练后评测）")
+    p.add_argument("--eval-limit", type=int, default=30)
+    p.add_argument("--eval-max-new-tokens", type=int, default=2048)
+    p.add_argument("--eval-workers", type=int, default=12)
     return p.parse_args()
 
 
-def load_records(args) -> list[dict]:
+def load_records(path: str, limit: int = 0) -> list[dict]:
     """读入 {prompt, output} 训练对"""
     records = []
-    with open(args.train_file, "r", encoding="utf-8") as fin:
+    with open(path, "r", encoding="utf-8") as fin:
         for line in fin:
             line = line.strip()
             if not line:
                 continue
             records.append(json.loads(line))
-            if args.limit and len(records) >= args.limit:
+            if limit and len(records) >= limit:
                 break
     return records
 
 
 def build_texts(records: list[dict], tokenizer) -> list[dict]:
     """按 chat 模板拼 user(prompt)+assistant(output) 两段文本"""
-    texts = []
+    return [
+        {
+            "text": tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": record["prompt"]},
+                    {"role": "assistant", "content": record["output"]},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        }
+        for record in records
+    ]
+
+
+def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int) -> tuple[list[dict], dict]:
+    """按长度过滤：超长样本直接剔除（不截断答案），返回过滤后数据与统计"""
+    kept, lengths = [], []
+    dropped = 0
+    for item in dataset_list:
+        n = len(tokenizer(item["text"], add_special_tokens=False)["input_ids"])
+        lengths.append(n)
+        if n > max_seq_len:
+            dropped += 1
+            continue
+        kept.append(item)
+    lengths.sort()
+    stats = {
+        "total": len(dataset_list),
+        "kept": len(kept),
+        "dropped_over_length": dropped,
+        "seq_len_median": lengths[len(lengths) // 2] if lengths else 0,
+        "seq_len_p95": lengths[int(len(lengths) * 0.95)] if lengths else 0,
+        "seq_len_max": lengths[-1] if lengths else 0,
+        "max_seq_len": max_seq_len,
+    }
+    return kept, stats
+
+
+def eval_on_holdout(model, tokenizer, args) -> dict | None:
+    """训练后留出集评测：生成 + 复用仓库评分器（只输出分数，不打印样本内容）"""
+    if not args.eval_file:
+        return None
+
+    from app.evaluation.embeddings import EmbeddingClient  # noqa: E402
+    from app.evaluation.scoring.aggregator import evaluate_sample  # noqa: E402
+    from unsloth import FastLanguageModel  # noqa: E402
+
+    records = load_records(args.eval_file, args.eval_limit)
+    FastLanguageModel.for_inference(model)
+    student_texts = []
+    started = time.time()
     for record in records:
-        text = tokenizer.apply_chat_template(
-            [
-                {"role": "user", "content": record["prompt"]},
-                {"role": "assistant", "content": record["output"]},
-            ],
-            tokenize=False,
-            add_generation_prompt=False,
+        messages = [{"role": "user", "content": record["prompt"]}]
+        # return_dict=True 一并拿到 attention_mask（pad 与 eos 同 token 时不传会告警且行为不可靠）
+        inputs = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True
+        ).to(model.device)
+        out = model.generate(
+            **inputs, max_new_tokens=args.eval_max_new_tokens,
+            do_sample=True, temperature=0.1, top_p=0.9,
         )
-        texts.append({"text": text})
-    return texts
+        student_texts.append(
+            tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        )
+    gen_seconds = (time.time() - started) / max(len(records), 1)
+
+    embedder = EmbeddingClient(device="cpu")  # 打分只走 CPU，避免与推理抢显存
+    keys = ("total_score", "json_valid", "memory_precision", "memory_recall",
+            "speaker_attribution", "hallucination_penalty", "summary_score", "intent_score", "other")
+    sums = {k: [0.0, 0] for k in keys}  # [累计, 适用条数]
+    for i, (record, student) in enumerate(zip(records, student_texts)):
+        payload = evaluate_sample(str(i), record["prompt"], record["output"], student, embedder).to_dict()
+        for k in keys:
+            if payload[k] is not None:
+                sums[k][0] += payload[k]
+                sums[k][1] += 1
+
+    print(f"\n=== 训练后留出集评测（n={len(records)}，{gen_seconds:.1f}s/条生成）===", flush=True)
+    result = {}
+    for k in keys:
+        total, usable = sums[k]
+        value = round(total / usable, 4) if usable else None
+        result[k] = value
+        print(f"  {k}: {value if value is not None else 'N/A'}  (适用 {usable}/{len(records)})", flush=True)
+    return result
 
 
 def main() -> None:
     args = parse_args()
+    started_all = time.time()
 
     from unsloth import FastLanguageModel
     from trl import SFTConfig, SFTTrainer
 
-    records = load_records(args)
+    records = load_records(args.train_file, args.limit)
     print(f"训练样本 {len(records)} 条（{args.train_file}）", flush=True)
 
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -89,44 +196,55 @@ def main() -> None:
         dtype=None,          # 自动（A10 走 bf16）
         load_in_4bit=False,  # 单卡 23G 下 2B/4B 的 LoRA 用 bf16 更稳、更快
     )
-    model = FastLanguageModel.get_peft_model(
-        model,
+
+    lora_kwargs = dict(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=0.0,
         bias="none",
         use_gradient_checkpointing="unsloth",  # 省显存的关键
         random_state=args.seed,
-        # 不指定 target_modules：混合架构（GatedDeltaNet + Full Attention）交给 unsloth 自动选择更稳
+        use_rslora=True,                       # 秩稳定缩放（rank>=16 推荐）
+        # 不指定 target_modules：unsloth 按架构自动选全部线性层（q/k/v/o/gate/up/down）
     )
+    try:
+        model = FastLanguageModel.get_peft_model(model, **lora_kwargs)
+    except TypeError:
+        # 老版本 unsloth 不认 use_rslora，退回经典缩放并明确告知
+        lora_kwargs.pop("use_rslora")
+        print("提示：当前 unsloth 不支持 use_rslora，回退经典 LoRA 缩放", flush=True)
+        model = FastLanguageModel.get_peft_model(model, **lora_kwargs)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # Qwen3.5 是多模态模型：from_pretrained 拿到的是 processor，直接喂纯文本会被当成图片源解析。
-    # 训练只用文本，取底层文本 tokenizer（processor.tokenizer）统一用于统计与 collator。
+    # Qwen3.5 是多模态模型：from_pretrained 拿到的是 processor，纯文本会被当成图片源解析，
+    # 训练只用文本，故取底层文本 tokenizer 统一用于统计与 collator。
     text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-
-    dataset_list = build_texts(records, text_tokenizer)
-    lengths = [len(text_tokenizer(t["text"], add_special_tokens=False)["input_ids"]) for t in dataset_list]
-    over = sum(1 for n in lengths if n > args.max_seq_len)
-    print(f"序列长度：中位={sorted(lengths)[len(lengths) // 2]} 最大={max(lengths)} "
-          f"超 {args.max_seq_len} 被截断={over}/{len(lengths)}", flush=True)
+    dataset_list, seq_stats = filter_by_length(build_texts(records, text_tokenizer),
+                                               text_tokenizer, args.max_seq_len)
+    print(f"序列长度过滤：保留 {seq_stats['kept']}/{seq_stats['total']}，"
+          f"超长剔除 {seq_stats['dropped_over_length']}；"
+          f"中位 {seq_stats['seq_len_median']} P95 {seq_stats['seq_len_p95']} 最大 {seq_stats['seq_len_max']}", flush=True)
+    print(f"可训练参数 {trainable:,} / {sum(p.numel() for p in model.parameters()):,} "
+          f"({trainable / max(sum(p.numel() for p in model.parameters()), 1):.2%})", flush=True)
 
     from datasets import Dataset
 
     dataset = Dataset.from_list(dataset_list)
 
     # 只对 assistant 段算 loss（按当前 tokenizer 的模板取锚点串）
-    instruction_part = "<|im_start|>user\n"
-    response_part = "<|im_start|>assistant\n"
-    if "<|im_start|>" not in tokenizer.chat_template:
-        instruction_part, response_part = None, None
+    instruction_part = response_part = None
+    if "<|im_start|>" in (text_tokenizer.chat_template or ""):
+        instruction_part, response_part = "<|im_start|>user\n", "<|im_start|>assistant\n"
+    else:
         print("警告：模板不是 Qwen 风格，跳过 response-only 掩码（全序列算 loss）", flush=True)
 
-    # 兼容不同 trl 版本的 SFTConfig 参数名（max_seq_length / max_length 等）
+    # 兼容不同 trl 版本的 SFTConfig 参数名
     supported = set(inspect.signature(SFTConfig.__init__).parameters)
     config_kwargs = {
         "output_dir": args.out_dir,
         "per_device_train_batch_size": args.batch_size,
         "gradient_accumulation_steps": args.grad_accum,
+        "group_by_length": args.group_by_length,
         "num_train_epochs": args.epochs,
         "max_steps": args.max_steps,
         "learning_rate": args.lr,
@@ -135,26 +253,21 @@ def main() -> None:
         "save_steps": args.save_steps,
         "save_total_limit": 2,
         "optim": "adamw_8bit",
-        "lr_scheduler_type": "linear",
-        "warmup_ratio": 0.03,
+        "lr_scheduler_type": args.lr_scheduler,
+        "warmup_ratio": args.warmup_ratio,
         "weight_decay": 0.0,
         "seed": args.seed,
+        "data_seed": args.seed,
         "report_to": [],
         "dataset_text_field": "text",
         "max_seq_length": args.max_seq_len,
         "max_length": args.max_seq_len,
-        "packing": False,
+        "packing": False,  # 未启用 FA2 varlen（本机只有 xformers），packing 会引入跨样本注意力污染
+        "neftune_noise_alpha": args.neftune_alpha or None,
     }
     config_kwargs = {k: v for k, v in config_kwargs.items() if k in supported}
-    print(f"SFTConfig 生效参数：{sorted(config_kwargs)}", flush=True)
 
-    trainer_kwargs = {"model": model, "train_dataset": dataset, "args": SFTConfig(**config_kwargs)}
-    trainer_params = set(inspect.signature(SFTTrainer.__init__).parameters)
-    if "processing_class" in trainer_params:
-        trainer_kwargs["processing_class"] = text_tokenizer
-    else:
-        trainer_kwargs["tokenizer"] = text_tokenizer
-    trainer = SFTTrainer(**trainer_kwargs)
+    trainer = SFTTrainer(model=model, train_dataset=dataset, args=SFTConfig(**config_kwargs))
     if instruction_part:
         try:
             from trl import train_on_responses_only as mask_helper
@@ -162,16 +275,40 @@ def main() -> None:
             from unsloth.chat_templates import train_on_responses_only as mask_helper
         trainer = mask_helper(trainer, instruction_part=instruction_part, response_part=response_part)
 
-    started = time.time()
     trainer.train()
-    print(f"训练完成，用时 {(time.time() - started) / 60:.1f} 分钟", flush=True)
+    train_minutes = (time.time() - started_all) / 60
+    print(f"训练完成，用时 {train_minutes:.1f} 分钟", flush=True)
 
     model.save_pretrained(args.out_dir)
-    tokenizer.save_pretrained(args.out_dir)
+    text_tokenizer.save_pretrained(args.out_dir)
     print(f"LoRA 适配器已保存：{args.out_dir}", flush=True)
 
+    holdout = eval_on_holdout(model, text_tokenizer, args)
+
+    # 训练配置与统计落盘，保证可复现（含数据规模、序列分布、超参、留出集分数）
+    run_info = {
+        "model": args.model,
+        "train_file": args.train_file,
+        "n_records": len(records),
+        "seq_stats": seq_stats,
+        "trainable_params": trainable,
+        "hyperparams": {
+            "epochs": args.epochs, "max_steps": args.max_steps, "lr": args.lr,
+            "batch_size": args.batch_size, "grad_accum": args.grad_accum,
+            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": True,
+            "neftune_alpha": args.neftune_alpha, "lr_scheduler": args.lr_scheduler,
+            "warmup_ratio": args.warmup_ratio, "group_by_length": args.group_by_length,
+            "seed": args.seed,
+        },
+        "train_minutes": round(train_minutes, 1),
+        "holdout_scores": holdout,
+    }
+    Path(args.out_dir, "train_run.json").write_text(
+        json.dumps(run_info, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"训练记录已保存：{args.out_dir}/train_run.json", flush=True)
+
     if args.merged_dir:
-        # 合并回 16bit 全量权重：评测端 vLLM 直接加载，绕开 vLLM 对混合架构 LoRA 的支持问题
         model.save_pretrained_merged(args.merged_dir, text_tokenizer, save_method="merged_16bit")
         print(f"合并权重已保存：{args.merged_dir}", flush=True)
 
