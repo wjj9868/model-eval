@@ -1,0 +1,16 @@
+# 虚拟环境 / IDE
+.venv/
+.idea/
+.trae/
+__pycache__/
+*.pyc
+
+# 测试产物
+.coverage
+htmlcov/
+
+# 涉密原始数据：本地保留，勿推远端（仅加密包例外）
+data/*.jsonl
+data/*.jsonl.gz
+data/*.state.json
+!data/user_chat_analysis.jsonl.gz.enc

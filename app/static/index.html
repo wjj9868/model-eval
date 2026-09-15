@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>开源模型对比评测平台</title>
+  <link rel="stylesheet" href="/css/app.css" />
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark"><i data-lucide="flask-conical"></i></span>
+        <div class="brand-text">
+          <strong>模型评测平台</strong>
+          <span>Model Eval</span>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="#/" data-nav="dashboard"><i data-lucide="layout-dashboard"></i>工作台</a>
+        <a href="#/models" data-nav="models"><i data-lucide="cpu"></i>模型管理</a>
+        <a href="#/prompts" data-nav="prompts"><i data-lucide="list-checks"></i>测试用例</a>
+        <a href="#/batches" data-nav="batches"><i data-lucide="history"></i>评测批次</a>
+        <a href="#/create" data-nav="create" class="nav-primary"><i data-lucide="plus-circle"></i>新建评测</a>
+      </nav>
+      <div class="sidebar-foot">v1.0 · 开源模型对比评测</div>
+    </aside>
+    <main class="main" id="view"></main>
+  </div>
+
+  <div class="modal-mask" id="modal-mask" hidden>
+    <div class="modal" id="modal"></div>
+  </div>
+  <div class="toast-stack" id="toasts"></div>
+
+  <script src="/js/api.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

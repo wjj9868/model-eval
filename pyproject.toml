@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/static/*", "app/main.py", "app/database.py", "app/config.py", "app/evaluation/embeddings.py"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
