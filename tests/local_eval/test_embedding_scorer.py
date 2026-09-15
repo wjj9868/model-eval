@@ -6,7 +6,7 @@ from app.evaluation.output_parser import parse_output
 from app.evaluation.prompt_parser import parse_prompt
 from app.evaluation.scoring.aggregator import evaluate_sample
 from app.evaluation.scoring.embedding_scorer import score_embedding
-from app.evaluation.scoring.schemas import WEIGHTS
+from app.evaluation.scoring.schemas import WEIGHTS, weighted_total
 from tests.local_eval.fakes import MockEmbedder, make_prompt
 
 # 测试用记忆条目
@@ -94,23 +94,26 @@ class TestMemoryMatching:
         assert result.memory_recall == 1.0
 
     def test_both_empty_memory(self, teacher_factory, prompt_factory):
-        """双方都无 memory → 空集语义 P=R=1"""
+        """双方都无 memory → 空集语义 P=R=1；grounding/幻觉/speaker 无判定依据 → None"""
         result = self._score(teacher_factory(), teacher_factory(), prompt_factory())
         assert result.memory_precision == 1.0
         assert result.memory_recall == 1.0
         assert result.memory_details == []
+        assert result.grounding_mean is None
+        assert result.hallucination_penalty is None
+        assert result.speaker_attribution is None
 
     def test_student_empty_teacher_has(self, teacher_factory, prompt_factory):
-        """student 漏记全部 → P=1（没写错的）R=0"""
+        """student 漏记全部 → P=R=0（空预测不奖励：没写错的也不给满分）"""
         result = self._score(teacher_factory(facts=[FACT_27]), teacher_factory(), prompt_factory())
-        assert result.memory_precision == 1.0
+        assert result.memory_precision == 0.0
         assert result.memory_recall == 0.0
 
     def test_student_has_teacher_empty(self, teacher_factory, prompt_factory):
-        """teacher 无 memory、student 凭空生成 → P=0 R=1（凭空记忆被罚）"""
+        """teacher 无 memory → 无 ground truth → P/R 均不适用（None，不计入加权）"""
         result = self._score(teacher_factory(), teacher_factory(facts=[FACT_FISHING]), prompt_factory())
-        assert result.memory_precision == 0.0
-        assert result.memory_recall == 1.0
+        assert result.memory_precision is None
+        assert result.memory_recall is None
 
     def test_cross_category_no_match(self, teacher_factory, prompt_factory):
         """同内容放错分类（facts→preferences）→ 分类内无法命中，P 与 R 双降"""
@@ -189,7 +192,7 @@ class TestGroundingAndSpeaker:
         )
         detail = result.memory_details[0]
         assert detail.evidence_is_user is None
-        assert result.speaker_attribution == 1.0  # 无可归因条目 → 满分
+        assert result.speaker_attribution is None  # 一条都不可判定 → 不适用（不奖不罚）
 
     def test_weak_evidence_half(self, teacher_factory):
         """词覆盖率 0.3~0.6 → grounding 0.5（可推导）"""
@@ -200,7 +203,7 @@ class TestGroundingAndSpeaker:
         assert result.memory_details[0].grounding == 0.5
 
     def test_no_evidence_hallucination(self, teacher_factory):
-        """完全无证据 → grounding 0，计入幻觉惩罚；归因无错可判不掺中性分"""
+        """完全无证据 → grounding 0，计入幻觉惩罚；归因不可判但有记忆 → 记 0"""
         result = self._score(
             teacher_factory(facts=[BANANAS]),
             [("2026-09-15 02:41:00", "Jay", "I'm an engineer from Texas.")],
@@ -208,20 +211,20 @@ class TestGroundingAndSpeaker:
         assert result.memory_details[0].grounding == 0.0
         assert result.memory_details[0].evidence_is_user is None
         assert result.hallucination_penalty == 1.0
-        assert result.speaker_attribution == 1.0
+        assert result.speaker_attribution is None  # 不可判定 → 不适用
 
     def test_unknown_speaker_excluded_from_attribution(self, teacher_factory):
-        """证据行说话人无法判定（第三方）→ 条目不进归因分母"""
+        """证据行说话人无法判定（第三方）→ 条目不进归因分母 → speaker 不适用"""
         result = self._score(
             teacher_factory(facts=["I'm an engineer from Texas"]),
             [("2026-09-15 02:41:00", "Stranger", "I'm an engineer from Texas.")],
         )
         detail = result.memory_details[0]
         assert detail.evidence_is_user is None
-        assert result.speaker_attribution == 1.0
+        assert result.speaker_attribution is None
 
     def test_no_evidence_source_neutral(self, teacher_factory):
-        """对话与先验段全缺失 → grounding 0.5 中性、不计幻觉"""
+        """对话与先验段全缺失 → grounding 0.5 中性、不计幻觉；不可归因 → speaker 不适用"""
         result = self._score(
             teacher_factory(facts=[FACT_27]),
             [],
@@ -230,14 +233,14 @@ class TestGroundingAndSpeaker:
         detail = result.memory_details[0]
         assert detail.grounding == 0.5
         assert result.hallucination_penalty == 0.0
-        assert result.speaker_attribution == 1.0
+        assert result.speaker_attribution is None
 
     def test_no_chat_prior_unsupported_is_hallucination(self, teacher_factory):
         """无对话、先验段（基本信息）存在但不支持该事实 → 记幻觉、不判归因"""
         result = self._score(teacher_factory(facts=[FACT_27]), [])
         assert result.memory_details[0].grounding == 0.0
         assert result.hallucination_penalty == 1.0
-        assert result.speaker_attribution == 1.0
+        assert result.speaker_attribution is None
 
     def test_fact_supported_by_user_info(self, teacher_factory):
         """基本信息段支持的事实（背景事实）→ 有 grounding、不计幻觉、归因正确"""
@@ -382,22 +385,34 @@ class TestAggregator:
         assert score.json_valid == 0.0
 
     def test_weighted_total_formula(self, teacher_factory, prompt_factory, mock_embedder):
-        """总分严格按权重线性组合"""
+        """总分严格按权重线性组合；不适用（None）的分项剔除后按剩余权重归一化"""
         prompt = prompt_factory()
         teacher_text = teacher_factory(facts=[FACT_27])
         # student 只多一条凭空记忆：precision 0.5 其余满分
         student_text = teacher_factory(facts=[FACT_27, BANANAS])
         score = evaluate_sample("s3", prompt, teacher_text, student_text, mock_embedder)
-        expected = (
-            WEIGHTS["memory_precision"] * 0.5
-            + WEIGHTS["speaker_attribution"] * score.speaker_attribution
-            + WEIGHTS["memory_recall"] * 1.0
-            + WEIGHTS["summary_score"] * score.summary_score
-            + WEIGHTS["intent_score"] * score.intent_score
-            + WEIGHTS["json_valid"] * 1.0
-            + WEIGHTS["other"] * score.other
-        )
+        terms: dict[str, float | None] = {
+            "memory_precision": 0.5,
+            "memory_recall": 1.0,
+            "speaker_attribution": score.speaker_attribution,
+            "hallucination": (
+                None if score.hallucination_penalty is None else 1.0 - score.hallucination_penalty
+            ),
+            "summary_score": score.summary_score,
+            "intent_score": score.intent_score,
+            "json_valid": 1.0,
+            "other": score.other,
+        }
+        applicable = {k: v for k, v in terms.items() if v is not None}
+        total_weight = sum(WEIGHTS[k] for k in applicable)
+        expected = sum(WEIGHTS[k] * v for k, v in applicable.items()) / total_weight
         assert score.total_score == pytest.approx(expected, abs=1e-4)
+
+    def test_not_applicable_dimension_is_excluded_from_weights(self):
+        """None 分项剔除后重新归一化：缺失维度不按 0 拉低总分"""
+        assert weighted_total({"json_valid": 1.0, "memory_precision": None}) == pytest.approx(1.0)
+        assert weighted_total({"json_valid": 1.0, "memory_precision": 0.0}) < 1.0
+        assert weighted_total({"json_valid": None, "memory_precision": None}) == 0.0
 
     def test_weights_sum_to_one(self):
         assert sum(WEIGHTS.values()) == pytest.approx(1.0)

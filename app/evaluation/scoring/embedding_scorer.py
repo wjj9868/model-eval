@@ -28,13 +28,13 @@ GROUNDING_STRONG_LEVEL = 1.0
 
 @dataclass
 class EmbeddingResult:
-    """L2 评分结果（各分项 0~1）"""
+    """L2 评分结果（各分项 0~1；None = 该维度不适用，加权时剔除并重新归一化）"""
 
-    memory_precision: float
-    memory_recall: float
-    speaker_attribution: float
-    grounding_mean: float
-    hallucination_penalty: float
+    memory_precision: float | None
+    memory_recall: float | None
+    speaker_attribution: float | None
+    grounding_mean: float | None
+    hallucination_penalty: float | None
     summary_score: float
     intent_score: float
     other: float
@@ -106,20 +106,26 @@ def score_embedding(
                 )
             )
 
-    precision = _safe_ratio(matched_student_count, student_total)
-    recall = _safe_ratio(matched_teacher_count, teacher_total)
+    precision = _precision(matched_student_count, student_total, teacher_total)
+    recall = _recall(matched_teacher_count, teacher_total, student_total)
 
-    # speaker 归因（任意行规则）：仅判可归因条目（用户侧有证据或人设强证据且无用户侧证据），
-    # 无法判定的条目不进分母；无可归因条目时记满分（归因无错误可查）
-    judged = [d for d in details if d.evidence_is_user is not None]
-    speaker = sum(float(d.evidence_is_user) for d in judged) / len(judged) if judged else 1.0
+    # speaker 归因（任意行规则）：只统计"有证据且归因可判定"的条目——
+    # 要求 grounding 达弱证据级且 evidence_is_user 非 None；无证据条目已由幻觉计入，不重复进分母。
+    # 一条都不可判定 → None（不适用，加权时剔除）：既不免费满分，也不倒扣。
+    judged = [
+        d for d in details
+        if d.grounding >= GROUNDING_WEAK_LEVEL and d.evidence_is_user is not None
+    ]
+    speaker = sum(float(d.evidence_is_user) for d in judged) / len(judged) if judged else None
 
+    # grounding / 幻觉只有"真的写了记忆条目"时才可评：
+    # 无条目 → None（不适用）。旧实现在这里给 grounding=1.0、幻觉=0，等于"什么都不写"白拿两项满分。
     if details:
-        grounding_mean = sum(d.grounding for d in details) / len(details)
-        hallucination = sum(1 for d in details if d.grounding == 0) / len(details)
+        grounding_mean = round(sum(d.grounding for d in details) / len(details), 4)
+        hallucination = round(sum(1 for d in details if d.grounding == 0) / len(details), 4)
     else:
-        grounding_mean = 1.0
-        hallucination = 0.0
+        grounding_mean = None
+        hallucination = None
 
     summary_score = _summary_score(teacher, student, vector_cache)
     intent_score = _intent_score(teacher, student, vector_cache)
@@ -129,8 +135,8 @@ def score_embedding(
         memory_precision=precision,
         memory_recall=recall,
         speaker_attribution=speaker,
-        grounding_mean=round(grounding_mean, 4),
-        hallucination_penalty=round(hallucination, 4),
+        grounding_mean=grounding_mean,
+        hallucination_penalty=hallucination,
         summary_score=summary_score,
         intent_score=intent_score,
         other=other,
@@ -334,7 +340,11 @@ def _summary_score(teacher: AnalysisResult, student: AnalysisResult, cache: _Vec
 
 
 def _intent_score(teacher: AnalysisResult, student: AnalysisResult, cache: _VectorCache) -> float:
-    """user_intent 评分：primary 枚举 0.5 + secondary 集合 Jaccard 0.2 + reasoning 语义 0.3"""
+    """user_intent 评分：primary 枚举 0.5 + secondary 集合 Jaccard 0.2 + reasoning 语义 0.3。
+
+    secondary_intents 非 schema 必填字段，teacher 常为空（实测 81%）。Jaccard 规则与 memory P/R 对齐：
+    双方都空 → 1.0（一致地"无次要意图"）；仅一方为空 → 0.0（不一致）。
+    """
     t_intent = teacher.raw.get("user_intent") if teacher.valid else {}
     s_intent = student.raw.get("user_intent") if student.valid else {}
     t_intent = t_intent if isinstance(t_intent, dict) else {}
@@ -401,6 +411,26 @@ def _score_closeness(teacher_score, student_score) -> float:
     return max(0.0, 1.0 - abs(teacher_score - student_score) / 9.0)
 
 
-def _safe_ratio(numerator: int, denominator: int) -> float:
-    """分母为 0 时返回 1.0（空集语义：无预测无错误即完美）"""
-    return numerator / denominator if denominator else 1.0
+def _precision(matched_student: int, student_total: int, teacher_total: int) -> float | None:
+    """记忆精确率；teacher 无条目时无 ground truth → None（不适用，不计入加权）。
+
+    - teacher 有条目：student 空 → 0.0（全漏，不因"没写错的"白拿满分）；否则 命中/条目数；
+    - 双方都空 → 1.0（一致地"无可记"）；
+    - teacher 空 + student 有条目 → None：没有对照说这些条目错，不奖励也不倒扣；
+      若属胡编，由 grounding/幻觉维度（只依赖 prompt 证据）兜底惩罚。
+    """
+    if teacher_total:
+        return matched_student / student_total if student_total else 0.0
+    return 1.0 if student_total == 0 else None
+
+
+def _recall(matched_teacher: int, teacher_total: int, student_total: int) -> float | None:
+    """记忆召回率；teacher 无条目时无可召回项 → None（不适用，不计入加权）。
+
+    - teacher 有条目：命中/条目数（student 空即 0.0，全漏）；
+    - 双方都空 → 1.0；
+    - teacher 空 + student 有条目 → None（无对照，谈不上漏记）。
+    """
+    if teacher_total:
+        return matched_teacher / teacher_total
+    return 1.0 if student_total == 0 else None

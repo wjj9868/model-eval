@@ -31,12 +31,19 @@ class TestJsonValidLevels:
         assert result.json_valid == 0.0
         assert result.checks == {"parseable": False}
 
-    def test_missing_field_is_half(self):
+    def test_missing_field_is_quarter(self):
+        """可解析但六字段不全 → 只给 0.25（不再给半程结构分）"""
         output = json.loads(_student({}))
         del output["rolling_summary"]
         result = score_rules(parse_output(json.dumps(output)))
-        assert result.json_valid == 0.5
+        assert result.json_valid == 0.25
         assert result.checks["fields_complete"] is False
+
+    def test_wrong_field_type_counts_as_incomplete(self):
+        """字段存在但类型不符（如 rolling_summary=null）→ 不算齐全，只给 0.25"""
+        result = score_rules(parse_output(_student({"rolling_summary": None})))
+        assert result.checks["fields_complete"] is False
+        assert result.json_valid == 0.25
 
     def test_parseable_with_defects_is_half(self):
         """可解析但 memory 分类缺失 → 0.5"""

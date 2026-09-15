@@ -29,8 +29,12 @@ def evaluate_sample(
 
     scores = {
         "memory_precision": semantic.memory_precision,
-        "speaker_attribution": semantic.speaker_attribution,
         "memory_recall": semantic.memory_recall,
+        "speaker_attribution": semantic.speaker_attribution,
+        # 幻觉是惩罚项，取补后与其它分项同向（越大越好）；无记忆条目时 penalty 为 None → 该维度不适用
+        "hallucination": (
+            None if semantic.hallucination_penalty is None else 1.0 - semantic.hallucination_penalty
+        ),
         "summary_score": semantic.summary_score,
         "intent_score": semantic.intent_score,
         "json_valid": rule.json_valid,
