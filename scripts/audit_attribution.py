@@ -10,14 +10,19 @@
 """
 from __future__ import annotations
 
+import argparse
 import collections
 import json
+import sys
+from pathlib import Path
 
-from app.evaluation.embeddings import EmbeddingClient
-from app.evaluation.output_parser import memory_items
-from app.evaluation.prompt_parser import parse_prompt
-from app.evaluation.scoring.embedding_scorer import (
-    GROUNDING_STRONG,
+# 允许直接 `python scripts/audit_attribution.py` 运行：把仓库根加入 sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.evaluation.embeddings import EmbeddingClient  # noqa: E402
+from app.evaluation.output_parser import memory_items, parse_output  # noqa: E402
+from app.evaluation.prompt_parser import parse_prompt  # noqa: E402
+from app.evaluation.scoring.embedding_scorer import (  # noqa: E402
     GROUNDING_WEAK,
     _VectorCache,
     _evidence_level,
@@ -50,8 +55,16 @@ def _old_sources(ctx, prompt: str) -> list[str]:
     return sources
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="归因误判审计（只输出计数，不输出样本内容）")
+    p.add_argument("--input", default="data/user_chat_analysis.jsonl", help="导出数据 JSONL")
+    p.add_argument("--limit", type=int, default=0, help="最多分析 N 条（0=全部）")
+    return p.parse_args()
+
+
 def main() -> None:
-    embedder = EmbeddingClient()
+    args = parse_args()
+    embedder = EmbeddingClient(device="cpu")  # 打分只走 CPU，避免与推理服务抢显存
     cache = _VectorCache(embedder)
 
     item_cls: collections.Counter = collections.Counter()   # 逐条事实分类
@@ -60,13 +73,14 @@ def main() -> None:
     unknown_lines = 0      # is_user=None 的聊天行总数
     total_lines = 0
 
-    with open("data/sample.jsonl", "r", encoding="utf-8") as fin:
+    total_samples = 0
+    with open(args.input, "r", encoding="utf-8") as fin:
         for line in fin:
+            if args.limit and total_samples >= args.limit:
+                break
+            total_samples += 1
             record = json.loads(line)
             ctx = parse_prompt(record["prompt"])
-            output = json.loads(record["output"])
-            # 构造仅用于 memory_items 的最小 AnalysisResult
-            from app.evaluation.output_parser import parse_output
             result = parse_output(record["output"])
             facts = [t for texts in memory_items(result).values() for t in texts]
 
@@ -111,7 +125,7 @@ def main() -> None:
     print("\n=== 逐样本 ===")
     for k, v in sample_cls.most_common():
         print(f"{k}: {v}")
-    print(f"\n名字提取失败样本: {name_fail}/200")
+    print(f"\n名字提取失败样本: {name_fail}/{total_samples}")
     print(f"聊天行 is_user=None 占比: {unknown_lines}/{total_lines}")
 
 

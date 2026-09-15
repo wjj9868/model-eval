@@ -12,10 +12,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from pathlib import Path
 
-from app.evaluation.embeddings import EmbeddingClient
-from app.evaluation.scoring.aggregator import evaluate_sample
+# 允许直接 `python scripts/clean_train_data.py` 运行：把仓库根加入 sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.evaluation.embeddings import EmbeddingClient  # noqa: E402
+from app.evaluation.scoring.aggregator import evaluate_sample  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reset", action="store_true", help="重跑：先清空 --out/--report 旧内容")
     p.add_argument("--progress-every", type=int, default=200, help="每 N 行打印一次进度")
     return p.parse_args()
+
+
+def _round_opt(value: float | None) -> float | None:
+    """可选分项保留 None（不适用），仅对数值四舍五入"""
+    return None if value is None else round(value, 4)
 
 
 def _stat_counts(score) -> tuple[int, int, int]:
@@ -45,7 +55,7 @@ def _stat_counts(score) -> tuple[int, int, int]:
 
 def main() -> None:
     args = parse_args()
-    embedder = EmbeddingClient()
+    embedder = EmbeddingClient(device="cpu")  # 自评只走 CPU，避免与推理服务抢显存
 
     open_mode = "w" if args.reset else "a"
     total = kept = dropped_speaker = dropped_parseable = 0
@@ -70,7 +80,9 @@ def main() -> None:
             score = evaluate_sample(str(line_no), record["prompt"], record["output"], record["output"], embedder)
             n_true, n_false, n_none = _stat_counts(score)
 
-            speaker_ok = score.speaker_attribution >= 1.0
+            # speaker/幻觉可能为 None（该维度不适用：无可判定条目 / 无记忆条目）——
+            # 不适用不等于有错，按"无归因错误"处理，避免误杀样本
+            speaker_ok = score.speaker_attribution is None or score.speaker_attribution >= 1.0
             parseable_ok = score.json_valid >= 1.0
             keep = speaker_ok and parseable_ok
             if not speaker_ok:
@@ -80,8 +92,8 @@ def main() -> None:
 
             frep.write(json.dumps({
                 "line_no": line_no,
-                "speaker_attribution": round(score.speaker_attribution, 4),
-                "hallucination_penalty": round(score.hallucination_penalty, 4),
+                "speaker_attribution": _round_opt(score.speaker_attribution),
+                "hallucination_penalty": _round_opt(score.hallucination_penalty),
                 "json_valid": score.json_valid,
                 "evidence_user": n_true,
                 "evidence_persona": n_false,

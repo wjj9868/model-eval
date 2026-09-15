@@ -1,0 +1,215 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "description": "A comprehensive analysis report on chat records between a user and an AI virtual character.",
+  "required": [
+    "analysis_summary",
+    "user_intent",
+    "paid_reaction",
+    "ai_performance",
+    "rolling_summary",
+    "memory_snapshot"
+  ],
+  "properties": {
+    "rolling_summary": {
+      "type": "string",
+      "description": "The rolling summary of the current conversation. Merge the [Previous Rolling Summary] with the [New Messages], then recompress and replace the previous summary rather than appending to it. Focus on what has been discussed so far: the progression of topics, developments in the relationship, agreements between both parties, and ongoing matters. Keep it within 300-500 characters."
+    },
+    "paid_reaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Track and analyze the user's reactions to paid elements (unlocking private photos (PRIVATE_PHOTO) and private videos (PRIVATE_VIDEO)).",
+      "required": [
+        "triggered",
+        "reaction_type",
+        "analysis"
+      ],
+      "properties": {
+        "triggered": {
+          "type": "boolean",
+          "description": "Whether any paid-related content was mentioned or triggered in the conversation."
+        },
+        "analysis": {
+          "type": "string",
+          "description": "A brief analysis and interpretation of the user's reaction."
+        },
+        "reaction_type": {
+          "type": "string",
+          "description": "The type of reaction shown by the user after paid content was triggered. POSITIVE (the user expressed willingness to pay or has already paid); NEGATIVE (the user complained, refused, or ended the conversation because of it); NEUTRAL_IGNORED (the user ignored the payment prompt or changed the subject); CURIOUS_INQUISITIVE (the user showed interest in the payment details and asked questions); NOT_TRIGGERED (no paid content was involved in the conversation).",
+          "enum": [
+            "POSITIVE",
+            "NEGATIVE",
+            "NEUTRAL_IGNORED",
+            "CURIOUS_INQUISITIVE",
+            "NOT_TRIGGERED"
+          ]
+        }
+      }
+    },
+    "analysis_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A quick, high-level overview of the conversation and chat.",
+      "required": [
+        "overall_impression",
+        "user_engagement_level"
+      ],
+      "properties": {
+        "overall_impression": {
+          "type": "string",
+          "description": "A brief summary of the overall impression of the conversation and its key events, usually in 2-3 sentences."
+        },
+        "user_engagement_level": {
+          "type": "string",
+          "description": "Assess the user's level of engagement and willingness to interact during the conversation.",
+          "enum": [
+            "LOW",
+            "MEDIUM",
+            "HIGH"
+          ]
+        }
+      }
+    },
+    "memory_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A snapshot of memories about the user. Update it based on the [Previous Memory Snapshot] and the [New Messages]: merge similar entries, replace outdated entries, and remove low-value entries rather than continuously appending new ones. Retain only information that remains valid and is likely to be useful in the future.",
+      "required": [
+        "facts",
+        "preferences",
+        "avoid_topics",
+        "active_events",
+        "open_loops"
+      ],
+      "properties": {
+        "active_events": {
+          "type": "array",
+          "description": "Recent events mentioned by the user (such as interviews, trips, or birthdays). Each event must include an expiration date and should no longer be mentioned after it expires.",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "content",
+              "expires_at"
+            ],
+            "properties": {
+              "expires_at": {
+                "type": "string",
+                "description": "The expiration date in yyyy-MM-dd format."
+              },
+              "content": {
+                "type": "string",
+                "description": "The event details, including the specific date."
+              }
+            }
+          }
+        },
+        "facts": {
+          "type": "array",
+          "description": "Stable facts explicitly mentioned by the user (such as occupation, place of residence, or family situation), with one fact per sentence.",
+          "maxItems": 10,
+          "items": {
+            "type": "string"
+          }
+        },
+        "open_loops": {
+          "type": "array",
+          "description": "Unresolved matters that can be proactively followed up on later (for example, asking about the outcome after an interview).",
+          "maxItems": 5,
+          "items": {
+            "type": "string"
+          }
+        },
+        "avoid_topics": {
+          "type": "array",
+          "description": "Topics to avoid (content the user has explicitly indicated they dislike or find uncomfortable).",
+          "maxItems": 5,
+          "items": {
+            "type": "string"
+          }
+        },
+        "preferences": {
+          "type": "array",
+          "description": "The user's stable preferences (such as things they like or dislike and their preferred conversation style), with one preference per sentence.",
+          "maxItems": 10,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "user_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Understand the user's motivation for chatting in this app.",
+      "required": [
+        "primary_intent"
+      ],
+      "properties": {
+        "reasoning": {
+          "type": "string",
+          "description": "Explain why these intentions were identified, preferably citing key statements from the conversation as evidence."
+        },
+        "primary_intent": {
+          "type": "string",
+          "description": "Assess the chat content, especially the opening messages, and identify the user's single most important and central intent. SERIOUS_RELATIONSHIP (the user is looking for a serious relationship or genuine dating); FRIENDS_WITH_BENEFITS (the user explicitly expresses an interest in finding a sexual partner, such as an FWB or casual sex partner); CASUAL_ENTERTAINMENT (the user is simply engaging in light conversation, joking around, or passing the time); EMOTIONAL_COMPANIONSHIP (the user expresses loneliness or sadness, or needs someone to confide in); SEXUAL_INTENT (the user's language centers solely on explicit sexual content, sexual teasing, or sexual fantasies); UNKNOWN (the conversation is too short or the information is too ambiguous to make a clear determination).",
+          "enum": [
+            "SERIOUS_RELATIONSHIP",
+            "FRIENDS_WITH_BENEFITS",
+            "CASUAL_ENTERTAINMENT",
+            "EMOTIONAL_COMPANIONSHIP",
+            "SEXUAL_INTENT",
+            "UNKNOWN"
+          ]
+        },
+        "secondary_intents": {
+          "type": "array",
+          "description": "A list of secondary or accompanying intentions present in the conversation. If there are none, return an empty array.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "SERIOUS_RELATIONSHIP",
+              "FRIENDS_WITH_BENEFITS",
+              "CASUAL_ENTERTAINMENT",
+              "EMOTIONAL_COMPANIONSHIP",
+              "SEXUAL_INTENT",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    "ai_performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Evaluate the performance of the AI virtual character to provide direction for future model iterations.",
+      "required": [
+        "naturalness_score",
+        "identity_awareness"
+      ],
+      "properties": {
+        "naturalness_score": {
+          "type": "integer",
+          "description": "A score for how natural the AI's responses are, where 1 indicates extremely mechanical responses and 10 indicates highly natural and fluent responses.",
+          "maximum": 10,
+          "minimum": 1
+        },
+        "identity_awareness": {
+          "type": "string",
+          "description": "The user's level of awareness of the AI's identity. NOT_DETECTED (the user is fully immersed in a conversation with a person); SUSPECTED (the user questions or suspects that they are interacting with an AI); DETECTED_AND_ACCEPTED (the user clearly knows it is an AI and interacts with it in a friendly manner); DETECTED_AND_EXPLOITED (the user takes advantage of the AI's characteristics to test or tease it).",
+          "enum": [
+            "NOT_DETECTED",
+            "SUSPECTED",
+            "DETECTED_AND_ACCEPTED",
+            "DETECTED_AND_EXPLOITED"
+          ]
+        },
+        "naturalness_reasoning": {
+          "type": "string",
+          "description": "Explain the reason for the score, highlighting the strengths or weaknesses of the AI's responses."
+        }
+      }
+    }
+  }
+}

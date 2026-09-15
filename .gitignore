@@ -1,9 +1,15 @@
 # 虚拟环境 / IDE
 .venv/
+.venv-vllm/
+.venv-train/
 .idea/
 .trae/
 __pycache__/
 *.pyc
+
+# 工具缓存
+.cargo/
+unsloth_compiled_cache/
 
 # 测试产物
 .coverage
@@ -13,4 +19,9 @@ htmlcov/
 data/*.jsonl
 data/*.jsonl.gz
 data/*.state.json
+data/*.png
+
+# 训练产出（LoRA 适配器 / 合并权重）
+models/
+
 !data/user_chat_analysis.jsonl.gz.enc
