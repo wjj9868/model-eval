@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="最多处理行数，0=处理到文件尾")
     p.add_argument("--reset", action="store_true", help="重跑：先清空 --out/--report 旧内容")
     p.add_argument("--progress-every", type=int, default=200, help="每 N 行打印一次进度")
+    p.add_argument("--device", default="cpu", choices=("cpu", "cuda"),
+                   help="embedder 设备：GPU 空闲的训练机用 cuda 提速（默认 cpu，与推理服务共存时用）")
     return p.parse_args()
 
 
@@ -55,7 +57,7 @@ def _stat_counts(score) -> tuple[int, int, int]:
 
 def main() -> None:
     args = parse_args()
-    embedder = EmbeddingClient(device="cpu")  # 自评只走 CPU，避免与推理服务抢显存
+    embedder = EmbeddingClient(device=args.device)
 
     open_mode = "w" if args.reset else "a"
     total = kept = dropped_speaker = dropped_parseable = 0
