@@ -60,8 +60,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=-1, help=">0 时覆盖 epochs（冒烟测试用）")
     p.add_argument("--max-seq-len", type=int, default=12288)
     p.add_argument("--lr", type=float, default=2e-4, help="LoRA 可比全参微调高一个量级")
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="每设备 batch：A10 23G 下 2B 的 LoRA 用 8 仍有余量，且能喂满算力（旧默认 2=显存只用到 ~20%）")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="梯度累积步数，与 --batch-size 乘积 = global batch（默认 = 8 × 1）")
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--neftune-alpha", type=float, default=5.0,

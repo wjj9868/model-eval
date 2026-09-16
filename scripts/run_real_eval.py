@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage", choices=("both", "generate", "score"), default="both",
                    help="generate: 只生成并落盘；score: 只读落盘输出打分；both: 生成+打分")
     p.add_argument("--workers", type=int, default=1, help="打分并行进程数（>1 走多进程）")
+    p.add_argument("--device", default="cpu", choices=("cpu", "cuda", "auto"),
+                   help="打分 embedder 设备：默认 cpu（避免与 vLLM 抢显存）；评测生成结束后可传 cuda 加速")
     return p.parse_args()
 
 
@@ -329,15 +331,23 @@ def read_students(path: str | None, limit: int) -> tuple[list[str], list[str | N
 
 # 每个打分进程内复用的 embedder（懒加载，避免重复载入模型）
 _WORKER_EMBEDDER = None
+_EMBED_DEVICE = "cpu"
+
+
+def _init_worker(device: str) -> None:
+    """多进程打分 worker 初始化：接收 embedder 设备参数（spawn 方式下全局变量不继承）"""
+    global _EMBED_DEVICE
+    _EMBED_DEVICE = device
 
 
 def _new_embedder() -> EmbeddingClient:
-    """打分用的 embedder：强制 CPU。
+    """打分用的 embedder：默认 CPU。
 
-    多进程打分时若让 SentenceTransformer 自动选设备，每个 worker 都会去占 GPU，
-    几十个进程会直接把显存打爆，且与 vLLM 抢资源；打分是纯 CPU 活，固定 CPU 最稳。
+    默认固定 CPU 的原因：多进程打分时若让 SentenceTransformer 自动选设备，
+    每个 worker 都会去占 GPU，几十个进程会直接把显存打爆，且与 vLLM 抢资源。
+    需要 GPU 打分时用 --device cuda 显式开启（评测生成结束后 vLLM 空闲，可安全复用）。
     """
-    return EmbeddingClient(device="cpu")
+    return EmbeddingClient(device=_EMBED_DEVICE)
 
 
 def _score_one(task: tuple[str, str, str, str]) -> dict:
@@ -358,7 +368,7 @@ def run_scoring(args, samples: list[dict], students: list[str], tag: str,
     payloads: list[dict] = []
     if args.workers > 1:
         print(f"并行打分：workers={args.workers}", flush=True)
-        with Pool(processes=args.workers) as pool:
+        with Pool(processes=args.workers, initializer=_init_worker, initargs=(args.device,)) as pool:
             for payload in pool.imap(_score_one, tasks, chunksize=2):
                 payloads.append(payload)
                 if len(payloads) % 50 == 0:
@@ -397,6 +407,8 @@ def print_report(results: list[dict], tag: str, args) -> None:
 
 def main() -> None:
     args = parse_args()
+    global _EMBED_DEVICE
+    _EMBED_DEVICE = args.device
     system_prompt = resolve_system_prompt(args)
     response_schema = resolve_response_schema(args)
     tag = args.served_model_name or args.model
