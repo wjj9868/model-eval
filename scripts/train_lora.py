@@ -209,6 +209,50 @@ def eval_on_holdout(model, tokenizer, args) -> dict | None:
     return result
 
 
+def plot_results(trainer, scores: dict | None, out_dir: Path) -> None:
+    """训练过程可视化：loss 曲线 + 留出集分项分数，合并一张 PNG 落盘到 out_dir。
+
+    标签用英文（服务器环境未必有中文字体，避免乱码）；matplotlib 为可选依赖，
+    缺失时降级为文本提示，不影响训练与评测主流程。
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # 无显示环境，只落盘
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("提示：未安装 matplotlib，跳过训练可视化（pip install matplotlib 后可见）", flush=True)
+        return
+
+    losses = [(e.get("step"), e.get("loss")) for e in trainer.state.log_history if e.get("loss") is not None]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    fig.suptitle(f"Training overview ({out_dir.name})")
+    if losses:
+        steps = [s for s, _ in losses]
+        values = [v for _, v in losses]
+        axes[0].plot(steps, values, marker="o", markersize=3, linewidth=1.2)
+        axes[0].set_xlabel("step")
+        axes[0].set_ylabel("train loss")
+        axes[0].set_title("Training loss")
+        axes[0].grid(alpha=0.3)
+    else:
+        axes[0].text(0.5, 0.5, "no loss data", ha="center", va="center", transform=axes[0].transAxes)
+        axes[0].axis("off")
+    if scores:
+        keys = list(scores.keys())
+        axes[1].barh(keys, [scores[k] for k in keys], color="#4B3FE3")
+        axes[1].set_xlim(0, 1)
+        axes[1].set_title("Holdout scores")
+        axes[1].grid(axis="x", alpha=0.3)
+    else:
+        axes[1].text(0.5, 0.5, "no eval scores", ha="center", va="center", transform=axes[1].transAxes)
+        axes[1].axis("off")
+    fig.tight_layout()
+    path = Path(out_dir, "training_curve.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"训练可视化已保存：{path}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     started_all = time.time()
@@ -315,6 +359,7 @@ def main() -> None:
     print(f"LoRA 适配器已保存：{args.out_dir}", flush=True)
 
     holdout = eval_on_holdout(model, text_tokenizer, args)
+    plot_results(trainer, holdout, Path(args.out_dir))
 
     # 训练配置与统计落盘，保证可复现（含数据规模、序列分布、超参、留出集分数）
     run_info = {
