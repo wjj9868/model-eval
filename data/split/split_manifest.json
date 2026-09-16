@@ -1,8 +1,8 @@
 {
-  "input": "data/user_chat_analysis.jsonl",
+  "input": "data/train_clean.jsonl",
   "seed": 42,
   "sizes": {
-    "train": 72965,
+    "train": 72837,
     "test": 1007,
     "dev": 506
   },
@@ -10,14 +10,14 @@
     "window": 256,
     "stride": 192,
     "max_df_ratio": 0.01,
-    "max_df": 744
+    "max_df": 743
   },
   "clusters": {
-    "n_clusters": 73474,
+    "n_clusters": 73364,
     "size_buckets": {
       "11-100": 14,
-      "2-10": 415,
-      "1": 73045
+      "2-10": 404,
+      "1": 72946
     },
     "largest": [
       89,
@@ -31,10 +31,10 @@
       16,
       16
     ],
-    "rows_in_multi_member_clusters": 1433,
-    "rare_windows": 11484,
-    "rare_window_rows": 38155,
-    "strong_pairs": 9003,
+    "rows_in_multi_member_clusters": 1404,
+    "rare_windows": 11430,
+    "rare_window_rows": 38031,
+    "strong_pairs": 8964,
     "max_shared_windows": 43,
     "template_windows": 7
   },
@@ -45,29 +45,29 @@
   },
   "stratum_distribution": {
     "mem0|len-l": {
-      "train": 0.0421,
+      "train": 0.0422,
       "test": 0.0477,
       "dev": 0.0435
     },
     "mem0|len-m": {
-      "train": 0.4399,
-      "test": 0.4379,
-      "dev": 0.4387
+      "train": 0.4407,
+      "test": 0.4369,
+      "dev": 0.4368
     },
     "mem0|len-s": {
-      "train": 0.0367,
-      "test": 0.0338,
-      "dev": 0.0375
+      "train": 0.0359,
+      "test": 0.0328,
+      "dev": 0.0356
     },
     "mem1-2|len-l": {
       "train": 0.1017,
-      "test": 0.0983,
+      "test": 0.1013,
       "dev": 0.1008
     },
     "mem1-2|len-m": {
-      "train": 0.1418,
-      "test": 0.15,
-      "dev": 0.1423
+      "train": 0.1419,
+      "test": 0.148,
+      "dev": 0.1403
     },
     "mem1-2|len-s": {
       "train": 0.0001,
@@ -76,11 +76,11 @@
     },
     "mem3-5|len-l": {
       "train": 0.1185,
-      "test": 0.1152,
-      "dev": 0.1126
+      "test": 0.1162,
+      "dev": 0.1186
     },
     "mem3-5|len-m": {
-      "train": 0.0217,
+      "train": 0.0216,
       "test": 0.0209,
       "dev": 0.0217
     },
@@ -90,7 +90,7 @@
       "dev": 0.002
     },
     "mem6+|len-l": {
-      "train": 0.0969,
+      "train": 0.097,
       "test": 0.0933,
       "dev": 0.0968
     },
@@ -101,8 +101,8 @@
     }
   },
   "file_sha1": {
-    "train.jsonl": "275462a54123e301c0eef270221ab460a246aeb6",
-    "test_1k.jsonl": "120cceaf4aced155b01de3656b50b1dccd172ebc",
-    "dev.jsonl": "d47c7f61ab500f317db1c62b9404319a1455e660"
+    "train.jsonl": "cd7d74fe4c080cfa9882329e69f2d0d45767eb8a",
+    "test_1k.jsonl": "9310d9b9d0bd65f7cce2515bff30ea6b5c510c59",
+    "dev.jsonl": "6b95a3e3af29ab356acf370e6df1ff77cefc119a"
   }
 }
