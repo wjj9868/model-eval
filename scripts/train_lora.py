@@ -107,17 +107,26 @@ def build_texts(records: list[dict], tokenizer) -> list[dict]:
     ]
 
 
-def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int) -> tuple[list[dict], dict]:
-    """按长度过滤：超长样本直接剔除（不截断答案），返回过滤后数据与统计"""
+def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int,
+                     batch_size: int = 512) -> tuple[list[dict], dict]:
+    """按长度过滤：超长样本直接剔除（不截断答案），返回过滤后数据与统计。
+
+    批量 tokenize（逐条调用在 7 万条上要 ~17 分钟，批量后约 1 分钟）。
+    """
     kept, lengths = [], []
     dropped = 0
-    for item in dataset_list:
-        n = len(tokenizer(item["text"], add_special_tokens=False)["input_ids"])
-        lengths.append(n)
-        if n > max_seq_len:
-            dropped += 1
-            continue
-        kept.append(item)
+    for start in range(0, len(dataset_list), batch_size):
+        batch = dataset_list[start:start + batch_size]
+        enc = tokenizer([item["text"] for item in batch], add_special_tokens=False)
+        for item, ids in zip(batch, enc["input_ids"]):
+            n = len(ids)
+            lengths.append(n)
+            if n > max_seq_len:
+                dropped += 1
+                continue
+            kept.append(item)
+        if (start // batch_size) % 16 == 0:
+            print(f"  长度过滤进度 {min(start + batch_size, len(dataset_list))}/{len(dataset_list)}", flush=True)
     lengths.sort()
     stats = {
         "total": len(dataset_list),
