@@ -1,6 +1,9 @@
 # @author: ztwz
 """训练/开发/测试集划分：内容聚类（防同会话跨集泄漏）+ 分层抽样。
 
+输入建议为 clean_train_data.py 的清洗产物（默认 data/train_clean.jsonl），
+链路：clean_train_data → split_dataset → train_lora（默认读 data/split/train.jsonl）。
+
 为什么不能简单按行随机切分：
 - 线上 prompt 是「固定头部 + 唯一内容 + 固定尾部」模板（实测 prefix512 仅 32 个唯一值、
   tail512 仅 50 个唯一值），同一用户的多条记录会共享中段的记忆块/上下文。
@@ -34,7 +37,8 @@ from app.evaluation.output_parser import memory_items, parse_output  # noqa: E40
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="按内容聚类 + 分层划分训练/开发/测试集")
-    p.add_argument("--input", default="data/user_chat_analysis.jsonl", help="全量数据（每行 {prompt, output}）")
+    p.add_argument("--input", default="data/train_clean.jsonl",
+                   help="全量数据（clean_train_data.py 清洗产物，每行 {prompt, output}）")
     p.add_argument("--out-dir", default="data/split", help="输出目录")
     p.add_argument("--test-size", type=int, default=1000, help="测试集目标条数（含强制样本）")
     p.add_argument("--dev-size", type=int, default=500, help="开发集目标条数（迭代调参用，不参与训练）")

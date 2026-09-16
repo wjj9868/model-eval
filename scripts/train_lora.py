@@ -1,7 +1,12 @@
 # @author: ztwz
 """LoRA 蒸馏训练：用线上 teacher 输出做 SFT，产出可直接被 vLLM 托管的合并权重。
 
-数据：{prompt, output} 的 JSONL（prompt 已是线上渲染好的完整输入，无 system prompt）。
+数据：{prompt, output} 的 JSONL（prompt 已是线上渲染好的完整输入）。
+口径（已对照线上源码 UserChatAnalysisAI / OpenRouterTaskCaller 核实）：线上为单条 user
+消息（无 system，任务指令嵌在 prompt 模板头部）+ response_format strict + temperature=1.0，
+训练样本构造与此同构；留出集评测同样 user-only、temperature 对齐线上。
+链路：clean_train_data.py 清洗 → split_dataset.py 划分 → 本脚本训练（默认输入 data/split/train.jsonl）。
+
 目标是「给定 prompt 产出六字段 JSON」，因此：
 - 走 chat 模板拼成 user/assistant 两段，**只在 assistant 段算 loss**（train_on_responses_only），
   避免把算力浪费在复述超长 prompt 上；
@@ -24,8 +29,8 @@
 依赖：.venv-train（unsloth + trl + peft + transformers<=5.5.0，复用系统 torch）。
 用法：
   .venv-train/bin/python scripts/train_lora.py \
-      --model Qwen/Qwen3.5-2B --train-file data/train_lora_2k.jsonl \
-      --eval-file data/eval_holdout_100.jsonl --eval-limit 30 \
+      --model Qwen/Qwen3.5-2B --train-file data/split/train.jsonl \
+      --eval-file data/split/test_1k.jsonl --eval-limit 30 \
       --out-dir models/lora_2b --merged-dir models/merged_2b --epochs 1
 """
 from __future__ import annotations
@@ -45,7 +50,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="LoRA 蒸馏训练（Unsloth + trl）")
     # 数据与产物
     p.add_argument("--model", default="Qwen/Qwen3.5-2B")
-    p.add_argument("--train-file", default="data/train_lora_2k.jsonl")
+    p.add_argument("--train-file", default="data/split/train.jsonl",
+                   help="训练数据（链路：clean_train_data → split_dataset → 本脚本）")
     p.add_argument("--out-dir", default="models/lora_run")
     p.add_argument("--merged-dir", default=None, help="给定则训练后合并权重落盘（供 vLLM 直接加载）")
     p.add_argument("--limit", type=int, default=0, help="只用前 N 条（0=全部）")
@@ -71,8 +77,9 @@ def parse_args() -> argparse.Namespace:
     # 训练后留出集快速评测（生成 + 复用仓库评分器）
     p.add_argument("--eval-file", default=None, help="留出集 JSONL（不传则跳过训练后评测）")
     p.add_argument("--eval-limit", type=int, default=30)
+    p.add_argument("--eval-temperature", type=float, default=1.0,
+                   help="留出集生成温度（线上硬编码 1.0，默认对齐）")
     p.add_argument("--eval-max-new-tokens", type=int, default=2048)
-    p.add_argument("--eval-workers", type=int, default=12)
     return p.parse_args()
 
 
@@ -141,9 +148,14 @@ def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int,
 
 
 def eval_on_holdout(model, tokenizer, args) -> dict | None:
-    """训练后留出集评测：生成 + 复用仓库评分器（只输出分数，不打印样本内容）"""
+    """训练后留出集评测：生成 + 复用仓库评分器（只输出分数，不打印样本内容）。
+
+    口径与线上一致：单条 user 消息、temperature 对齐（本地 generate 无结构化输出约束）。
+    """
     if not args.eval_file:
         return None
+
+    import torch  # 延迟导入，脚本主体不强制依赖
 
     from app.evaluation.embeddings import EmbeddingClient  # noqa: E402
     from app.evaluation.scoring.aggregator import evaluate_sample  # noqa: E402
@@ -151,6 +163,7 @@ def eval_on_holdout(model, tokenizer, args) -> dict | None:
 
     records = load_records(args.eval_file, args.eval_limit)
     FastLanguageModel.for_inference(model)
+    torch.manual_seed(args.seed)  # 评测采样可复现
     student_texts = []
     started = time.time()
     for record in records:
@@ -161,11 +174,14 @@ def eval_on_holdout(model, tokenizer, args) -> dict | None:
         ).to(model.device)
         out = model.generate(
             **inputs, max_new_tokens=args.eval_max_new_tokens,
-            do_sample=True, temperature=0.1, top_p=0.9,
+            do_sample=True, temperature=args.eval_temperature, top_p=0.9,
         )
-        student_texts.append(
-            tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        )
+        row = out[0][inputs["input_ids"].shape[1]:]
+        # 截断（打满 max_new_tokens 未停）按调用失败降级：记空文本 → 评分全 0（与线上语义一致）
+        if bool((row == tokenizer.eos_token_id).any()):
+            student_texts.append(tokenizer.decode(row, skip_special_tokens=True))
+        else:
+            student_texts.append("")
     gen_seconds = (time.time() - started) / max(len(records), 1)
 
     embedder = EmbeddingClient(device="cpu")  # 打分只走 CPU，避免与推理抢显存
@@ -180,6 +196,8 @@ def eval_on_holdout(model, tokenizer, args) -> dict | None:
                 sums[k][1] += 1
 
     print(f"\n=== 训练后留出集评测（n={len(records)}，{gen_seconds:.1f}s/条生成）===", flush=True)
+    truncated = sum(1 for s in student_texts if not s)
+    print(f"  截断失败（打满 max_new_tokens，计 0 分）: {truncated}/{len(records)}", flush=True)
     result = {}
     for k in keys:
         total, usable = sums[k]
@@ -216,11 +234,13 @@ def main() -> None:
         use_rslora=True,                       # 秩稳定缩放（rank>=16 推荐）
         # 不指定 target_modules：unsloth 按架构自动选全部线性层（q/k/v/o/gate/up/down）
     )
+    use_rslora = True
     try:
         model = FastLanguageModel.get_peft_model(model, **lora_kwargs)
     except TypeError:
         # 老版本 unsloth 不认 use_rslora，退回经典缩放并明确告知
         lora_kwargs.pop("use_rslora")
+        use_rslora = False
         print("提示：当前 unsloth 不支持 use_rslora，回退经典 LoRA 缩放", flush=True)
         model = FastLanguageModel.get_peft_model(model, **lora_kwargs)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -304,13 +324,23 @@ def main() -> None:
         "hyperparams": {
             "epochs": args.epochs, "max_steps": args.max_steps, "lr": args.lr,
             "batch_size": args.batch_size, "grad_accum": args.grad_accum,
-            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": True,
+            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": use_rslora,
             "neftune_alpha": args.neftune_alpha, "lr_scheduler": args.lr_scheduler,
             "warmup_ratio": args.warmup_ratio, "group_by_length": args.group_by_length,
             "seed": args.seed,
         },
         "train_minutes": round(train_minutes, 1),
         "holdout_scores": holdout,
+        # 评测口径一并落盘，保证分数可解释（对齐线上：user-only、temperature=1.0）
+        "holdout_eval_config": {
+            "file": args.eval_file,
+            "limit": args.eval_limit,
+            "temperature": args.eval_temperature,
+            "max_new_tokens": args.eval_max_new_tokens,
+            "system_prompt": False,
+            "response_schema": None,
+            "seed": args.seed,
+        },
     }
     Path(args.out_dir, "train_run.json").write_text(
         json.dumps(run_info, ensure_ascii=False, indent=2), encoding="utf-8"

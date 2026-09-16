@@ -326,8 +326,19 @@ def _evidence_level(sim: float, overlap: float) -> float:
 
 
 def _word_set(text: str) -> set[str]:
-    """小写词集合（中英文通用：连续字母/数字/CJK 均视作词）"""
-    return set(re.findall(r"[\w]+", text.lower(), re.UNICODE))
+    """词覆盖率特征集合：英文/数字连续段整体为词，中文连续段按字符二元组切分。
+
+    Python 正则的 \\w 会把整段连续汉字当成一个"词"，中文句子间几乎永不整段相等，
+    词覆盖率通道因此系统性失效（证据分级退化为纯 cosine 单通道）；
+    改用 bigram 后中文 overlap 才真正参与 grounding/归因判定。
+    """
+    words = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        if len(run) == 1:
+            words.add(run)
+        else:
+            words.update(run[i : i + 2] for i in range(len(run) - 1))
+    return words
 
 
 def _summary_score(teacher: AnalysisResult, student: AnalysisResult, cache: _VectorCache) -> float:
