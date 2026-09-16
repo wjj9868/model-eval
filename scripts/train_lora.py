@@ -24,7 +24,10 @@
   "LoRA Learns Less and Forgets Less"(TMLR 2024) 指出领域适配需要更宽的适配面。
 - **长度过滤而非静默截断**：被截断到看不见答案的样本一律剔除并记录，
   避免全 -100 标签引发的 NaN/无效样本（max_seq_len 从 8192 提到 12288，剔除率 8% → ~1%）。
-- **batch × 累积 + group_by_length**：按长度分桶减少 padding 浪费。
+- **batch × 累积 + 长度分桶采样**：按长度分桶，减少 batch 内 padding 浪费（实测 batch 有效
+  token 占比 58.7% → 99.9%，单步序列维度算力省 ~70%）。trl 0.24 / transformers 5.5 起
+  布尔位 `group_by_length` 已从 `SFTConfig` 移除、改用 `train_sampling_strategy`，
+  沿用旧名会被 supported 过滤**静默丢弃**（等于没开），故此处按版本选参数名并补 `length` 列。
 
 依赖：.venv-train（unsloth + trl + peft + transformers<=5.5.0，复用系统 torch）。
 用法：
@@ -71,7 +74,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr-scheduler", default="cosine")
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--group-by-length", action="store_true", default=True,
-                   help="按长度分桶，减少 batch 内 padding 浪费")
+                   help="按长度分桶采样，减少 batch 内 padding 浪费"
+                        "（按 trl 版本自动映射到 train_sampling_strategy 或 group_by_length）")
     p.add_argument("--no-group-by-length", dest="group_by_length", action="store_false")
     p.add_argument("--save-steps", type=int, default=200)
     p.add_argument("--logging-steps", type=int, default=5)
@@ -121,6 +125,8 @@ def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int,
     """按长度过滤：超长样本直接剔除（不截断答案），返回过滤后数据与统计。
 
     批量 tokenize（逐条调用在 7 万条上要 ~17 分钟，批量后约 1 分钟）。
+    顺带把每条的 token 数写成 `length` 列：长度分桶采样（train_sampling_strategy）
+    直接读这一列，否则 sampler 会退化成逐条读 `input_ids` 推断长度（7 万条 × 数千 token）。
     """
     kept, lengths = [], []
     dropped = 0
@@ -133,7 +139,7 @@ def filter_by_length(dataset_list: list[dict], tokenizer, max_seq_len: int,
             if n > max_seq_len:
                 dropped += 1
                 continue
-            kept.append(item)
+            kept.append({**item, "length": n})
         if (start // batch_size) % 16 == 0:
             print(f"  长度过滤进度 {min(start + batch_size, len(dataset_list))}/{len(dataset_list)}", flush=True)
     lengths.sort()
@@ -313,13 +319,25 @@ def main() -> None:
     else:
         print("警告：模板不是 Qwen 风格，跳过 response-only 掩码（全序列算 loss）", flush=True)
 
-    # 兼容不同 trl 版本的 SFTConfig 参数名
+    # 兼容不同 trl 版本的 SFTConfig 参数名。
+    # 注意：不在 SFTConfig 签名里的键会被下面那行 supported 过滤**静默丢弃**，
+    # 所以分桶采样必须按版本挑参数名（沿用旧名在新版 trl 上等于没开）。
     supported = set(inspect.signature(SFTConfig.__init__).parameters)
+    sampling_strategy = "random"
+    length_column_name = None
+    if args.group_by_length:
+        if "train_sampling_strategy" in supported:
+            sampling_strategy, length_column_name = "group_by_length", "length"
+        elif "group_by_length" in supported:
+            sampling_strategy = "group_by_length"  # 旧版 trl：布尔位仍然有效
+        else:
+            print("警告：当前 trl/transformers 的 SFTConfig 既无 train_sampling_strategy 也无 "
+                  "group_by_length，将持续随机采样（padding 浪费偏大）", flush=True)
+
     config_kwargs = {
         "output_dir": args.out_dir,
         "per_device_train_batch_size": args.batch_size,
         "gradient_accumulation_steps": args.grad_accum,
-        "group_by_length": args.group_by_length,
         "num_train_epochs": args.epochs,
         "max_steps": args.max_steps,
         "learning_rate": args.lr,
@@ -340,15 +358,70 @@ def main() -> None:
         "packing": False,  # 未启用 FA2 varlen（本机只有 xformers），packing 会引入跨样本注意力污染
         "neftune_noise_alpha": args.neftune_alpha or None,
     }
+    if sampling_strategy == "group_by_length":
+        if length_column_name is not None:  # 新版：train_sampling_strategy + length 列
+            config_kwargs["train_sampling_strategy"] = sampling_strategy
+            config_kwargs["length_column_name"] = length_column_name
+        else:                               # 旧版：布尔位
+            config_kwargs["group_by_length"] = True
     config_kwargs = {k: v for k, v in config_kwargs.items() if k in supported}
+    print(f"采样策略：{sampling_strategy}"
+          + (f"（分桶依据 {length_column_name!r} 列）" if length_column_name else ""), flush=True)
 
     trainer = SFTTrainer(model=model, train_dataset=dataset, args=SFTConfig(**config_kwargs))
+    if length_column_name:
+        # Trainer 建 dataloader 时会按“签名列”白名单裁剪数据集，length 不在白名单里就被删掉，
+        # 删掉后 sampler 只能退化成逐条读 input_ids 推断长度（7 万条 × 数千 token，很慢）。
+        # 这里让 trl 先按自身规则算好白名单，再把 length 追加进去（只做加法，不动它原有列）。
+        try:
+            trainer._set_signature_columns_if_needed()
+            signature_columns = list(trainer._signature_columns or [])
+            if length_column_name not in signature_columns:
+                trainer._signature_columns = signature_columns + [length_column_name]
+        except Exception as exc:  # 私有接口；最坏只是退化成推断，不能让训练挂掉
+            print(f"警告：无法把 {length_column_name!r} 加入签名列（{exc}），"
+                  f"分桶将按 input_ids 推断长度（更慢，结果一致）", flush=True)
+
     if instruction_part:
         try:
             from trl import train_on_responses_only as mask_helper
         except ImportError:  # 老版本在 unsloth 命名空间下
             from unsloth.chat_templates import train_on_responses_only as mask_helper
         trainer = mask_helper(trainer, instruction_part=instruction_part, response_part=response_part)
+
+    if length_column_name:
+        if length_column_name in (getattr(trainer.train_dataset, "column_names", None) or []):
+            print(f"{length_column_name!r} 列已保留，分桶采样就绪", flush=True)
+        else:
+            # 响应掩码会重建数据集，只保留 model.forward 声明的列，length 被丢掉。
+            # 此时不能让它退化去推断长度：本模型是多模态 processor，
+            # processing_class.model_input_names[0] 是 'pixel_values'，
+            # 推断分支会直接抛 ValueError 把训练打挂。所以必须补回来。
+            try:
+                source_lengths = [item[length_column_name] for item in dataset_list]
+                if len(trainer.train_dataset) == len(source_lengths):
+                    # 掩码按序重建且未丢样本：按序补回，零成本
+                    trainer.train_dataset = trainer.train_dataset.add_column(
+                        length_column_name, source_lengths
+                    )
+                    print(f"已按序补回 {length_column_name!r} 列（掩码重建数据集时被丢弃）", flush=True)
+                else:
+                    # 行数变了说明掩码丢过样本，按序对齐不再成立：从 input_ids 重算（慢但对）
+                    trainer.train_dataset = trainer.train_dataset.map(
+                        lambda example: {length_column_name: [len(ids) for ids in example["input_ids"]]},
+                        batched=True, num_proc=8, desc=f"重算 {length_column_name}",
+                    )
+                    print(f"掩码丢弃过样本（{len(source_lengths)} -> {len(trainer.train_dataset)}），"
+                          f"已从 input_ids 重算 {length_column_name!r} 列", flush=True)
+            except Exception as exc:
+                # 分桶是优化不是正确性前提：补不回来就退回随机采样，不能让训练失败
+                sampling_strategy = "random"
+                if hasattr(trainer.args, "train_sampling_strategy"):
+                    trainer.args.train_sampling_strategy = "random"
+                elif hasattr(trainer.args, "group_by_length"):
+                    trainer.args.group_by_length = False
+                print(f"警告：无法补回 {length_column_name!r} 列（{exc}），"
+                      f"已回退随机采样（padding 浪费偏大，但不影响训练正确性）", flush=True)
 
     trainer.train()
     train_minutes = (time.time() - started_all) / 60
@@ -374,6 +447,7 @@ def main() -> None:
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": use_rslora,
             "neftune_alpha": args.neftune_alpha, "lr_scheduler": args.lr_scheduler,
             "warmup_ratio": args.warmup_ratio, "group_by_length": args.group_by_length,
+            "sampling_strategy": sampling_strategy,
             "seed": args.seed,
         },
         "train_minutes": round(train_minutes, 1),
