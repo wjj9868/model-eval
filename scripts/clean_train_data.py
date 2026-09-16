@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from multiprocessing import Pool
@@ -56,8 +57,12 @@ def _init_worker(device: str) -> None:
     """进程池 initializer：为每个 worker 建一份 embedder。
 
     父进程不初始化 embedder/CUDA：fork 启动方式下父进程先碰 GPU 会破坏子进程上下文。
+    多进程下每 worker 的 torch/tokenizer 默认各吃满所有核，互相争抢反而拖慢
+    （实测 8 worker 仅 1.4 倍提速的根因），限单线程后由进程级并行承担吞吐。
     """
     global _WORKER_EMBEDDER
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     _WORKER_EMBEDDER = EmbeddingClient(device=device)
 
 
