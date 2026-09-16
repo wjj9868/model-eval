@@ -4,6 +4,7 @@
 .venv-train/
 .idea/
 .trae/
+.vscode/
 __pycache__/
 *.pyc
 
@@ -20,6 +21,8 @@ data/*.jsonl
 data/*.jsonl.gz
 data/*.state.json
 data/*.png
+# 划分产物同样涉密（仅保留 split_manifest.json 统计清单）
+data/split/*.jsonl
 
 # 训练产出（LoRA 适配器 / 合并权重）
 models/

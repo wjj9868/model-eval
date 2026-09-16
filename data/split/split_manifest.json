@@ -1,0 +1,108 @@
+{
+  "input": "data/user_chat_analysis.jsonl",
+  "seed": 42,
+  "sizes": {
+    "train": 72965,
+    "test": 1007,
+    "dev": 506
+  },
+  "window_params": {
+    "window": 256,
+    "stride": 192,
+    "max_df_ratio": 0.01,
+    "max_df": 744
+  },
+  "clusters": {
+    "n_clusters": 73474,
+    "size_buckets": {
+      "11-100": 14,
+      "2-10": 415,
+      "1": 73045
+    },
+    "largest": [
+      89,
+      55,
+      39,
+      25,
+      23,
+      22,
+      21,
+      17,
+      16,
+      16
+    ],
+    "rows_in_multi_member_clusters": 1433,
+    "rare_windows": 11484,
+    "rare_window_rows": 38155,
+    "strong_pairs": 9003,
+    "max_shared_windows": 43,
+    "template_windows": 7
+  },
+  "forced_test": {
+    "file": "data/eval_holdout_100.jsonl",
+    "n": 100,
+    "position": "测试集前 N 条，顺序与原文件一致"
+  },
+  "stratum_distribution": {
+    "mem0|len-l": {
+      "train": 0.0421,
+      "test": 0.0477,
+      "dev": 0.0435
+    },
+    "mem0|len-m": {
+      "train": 0.4399,
+      "test": 0.4379,
+      "dev": 0.4387
+    },
+    "mem0|len-s": {
+      "train": 0.0367,
+      "test": 0.0338,
+      "dev": 0.0375
+    },
+    "mem1-2|len-l": {
+      "train": 0.1017,
+      "test": 0.0983,
+      "dev": 0.1008
+    },
+    "mem1-2|len-m": {
+      "train": 0.1418,
+      "test": 0.15,
+      "dev": 0.1423
+    },
+    "mem1-2|len-s": {
+      "train": 0.0001,
+      "test": 0.001,
+      "dev": 0.002
+    },
+    "mem3-5|len-l": {
+      "train": 0.1185,
+      "test": 0.1152,
+      "dev": 0.1126
+    },
+    "mem3-5|len-m": {
+      "train": 0.0217,
+      "test": 0.0209,
+      "dev": 0.0217
+    },
+    "mem3-5|len-s": {
+      "train": 0.0001,
+      "test": 0.001,
+      "dev": 0.002
+    },
+    "mem6+|len-l": {
+      "train": 0.0969,
+      "test": 0.0933,
+      "dev": 0.0968
+    },
+    "mem6+|len-m": {
+      "train": 0.0004,
+      "test": 0.001,
+      "dev": 0.002
+    }
+  },
+  "file_sha1": {
+    "train.jsonl": "275462a54123e301c0eef270221ab460a246aeb6",
+    "test_1k.jsonl": "120cceaf4aced155b01de3656b50b1dccd172ebc",
+    "dev.jsonl": "d47c7f61ab500f317db1c62b9404319a1455e660"
+  }
+}
