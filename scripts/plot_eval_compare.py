@@ -53,7 +53,7 @@ plt.rcParams["axes.unicode_minus"] = False
 # 曲线配色（按顺序循环取用）：蓝 / 橙 / 绿 / 红 / 青 / 紫
 SERIES_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2"]
 
-# 维度顺序与展示名；hallucination_penalty 为惩罚项（越低越好），其余越大越好
+# 维度顺序与展示名；hallucination_penalty 为惩罚项（越低越好），Grounding 证据均值越高越好
 DIMENSIONS = [
     ("total_score", "总分"),
     ("json_valid", "JSON 合法"),
@@ -61,9 +61,9 @@ DIMENSIONS = [
     ("memory_recall", "记忆召回"),
     ("speaker_attribution", "说话人归属"),
     ("summary_score", "摘要质量"),
-    ("intent_score", "意图识别"),
+    ("intent_score", "意图匹配"),
     ("other", "其它"),
-    ("hallucination_penalty", "幻觉惩罚(越低越好)"),
+    ("hallucination_penalty", "幻觉惩罚↓"),
 ]
 CHECK_NAMES = [
     ("parseable", "可解析"),
@@ -297,7 +297,7 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
             ax7.text(xi + offset, value + 0.02, f"{value:.2f}", ha="center", fontsize=7)
     ax7.grid(axis="y", alpha=0.3)
 
-    # 8) 幻觉率与 grounding 均值（均为"越低越好"）
+    # 8) 幻觉惩罚（越低越好）与 grounding 证据均值（越高越好）
     ax8 = fig.add_subplot(4, 4, 8)
     penalty = [mean_over_applicable([dim_value(r, "hallucination_penalty") for r in rows])
                for rows in aligned]
@@ -314,9 +314,9 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         ax8.text(0 + offset, penalty[i] + 0.02, f"{penalty[i]:.2f}", ha="center", fontsize=7)
         ax8.text(1 + offset, grounding[i] + 0.02, f"{grounding[i]:.2f}", ha="center", fontsize=7)
     ax8.set_xticks(x8)
-    ax8.set_xticklabels(["幻觉惩罚率↓", "grounding↓"])
+    ax8.set_xticklabels(["幻觉惩罚↓", "grounding↑"])
     ax8.set_ylim(0, 1.12)
-    ax8.set_title("⑧ 幻觉与证据（越低越好）")
+    ax8.set_title("⑧ 幻觉惩罚与证据均值")
     ax8.legend(fontsize=7)
     ax8.grid(axis="y", alpha=0.3)
 
@@ -417,7 +417,7 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
     ])
     im14 = ax14.imshow(applicable, cmap="viridis", vmin=0.0, vmax=1.0, aspect="auto")
     ax14.set_xticks(range(len(OPTIONAL_DIMS)))
-    ax14.set_xticklabels([name for k, name in DIMENSIONS if k in OPTIONAL_DIMS] + ["grounding"],
+    ax14.set_xticklabels([name for k, name in DIMENSIONS if k in OPTIONAL_DIMS] + ["证据均值↑"],
                          rotation=25, ha="right", fontsize=8)
     ax14.set_yticks(range(len(labels)))
     ax14.set_yticklabels(labels, fontsize=8)
@@ -436,17 +436,17 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         ("总分均值", lambda rs: f"{mean([r['total_score'] for r in rs]):.4f}"),
         ("总分中位数", lambda rs: f"{median([r['total_score'] for r in rs]):.4f}"),
         ("总分P10", lambda rs: f"{pct([r['total_score'] for r in rs], 10):.4f}"),
-        ("JSON全通过", lambda rs: f"{json_share(rs, 1.0):.3f}"),
-        ("JSON无效", lambda rs: f"{json_share(rs, 0.0):.3f}"),
+        ("JSON 全通过率", lambda rs: f"{json_share(rs, 1.0):.3f}"),
+        ("JSON 无效率", lambda rs: f"{json_share(rs, 0.0):.3f}"),
         ("截断率", lambda rs: f"{trunc_rate(rs):.3f}"),
         ("记忆准确率", lambda rs: f"{mean_over_applicable([dim_value(r, 'memory_precision') for r in rs]):.3f}"),
         ("记忆召回", lambda rs: f"{mean_over_applicable([dim_value(r, 'memory_recall') for r in rs]):.3f}"),
         ("说话人归属", lambda rs: f"{mean_over_applicable([dim_value(r, 'speaker_attribution') for r in rs]):.3f}"),
         ("摘要质量", lambda rs: f"{mean_over_applicable([dim_value(r, 'summary_score') for r in rs]):.3f}"),
-        ("意图识别", lambda rs: f"{mean_over_applicable([dim_value(r, 'intent_score') for r in rs]):.3f}"),
+        ("意图匹配", lambda rs: f"{mean_over_applicable([dim_value(r, 'intent_score') for r in rs]):.3f}"),
         ("其它", lambda rs: f"{mean_over_applicable([dim_value(r, 'other') for r in rs]):.3f}"),
         ("幻觉惩罚↓", lambda rs: f"{mean_over_applicable([dim_value(r, 'hallucination_penalty') for r in rs]):.3f}"),
-        ("grounding↓", lambda rs: f"{mean_over_applicable([dim_value(r, 'grounding_mean') for r in rs]):.3f}"),
+        ("证据均值↑", lambda rs: f"{mean_over_applicable([dim_value(r, 'grounding_mean') for r in rs]):.3f}"),
     ]
     cell_text = [[fn(s["rows"]) for s in series] for _, fn in table_metrics]
     table = ax15.table(cellText=cell_text,
@@ -467,7 +467,7 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         "权重：记忆P .18 / 记忆R .18 / 归因 .14 / 摘要 .15 / 意图 .10 / JSON .10 / 幻觉 .08 / 其它 .07",
         "None 语义：该维度无判定依据时剔除并重新归一化权重（不是按 0 计）",
         f"对齐：1~14 面板仅用公共前缀 n={n_common}；⑮ 用各自全量样本，两者不可混读",
-        "惩罚项：幻觉惩罚、grounding 越低越好；⑪ 已把幻觉取补，统一为“正=更好”",
+        "方向：幻觉惩罚↓、grounding 证据均值↑；⑪ 已把幻觉取补，统一为“正=更好”",
         "截断：finish_reason=length 按调用失败降级（评分全 0），是本流程唯一残余失败模式",
         "读图重点：先看 ⑤/⑦ 结构层（能否稳定产出结构），再看 ⑬ 语义层（真变聪明了吗）",
         "",
