@@ -323,15 +323,26 @@ class TestSummaryIntentOther:
         assert result.intent_score == pytest.approx(1.0, abs=1e-3)
 
     def test_intent_partial(self, teacher_factory, prompt_factory, mock_embedder):
-        """primary 不同、reasoning 不同、secondary 部分重合 → 仅 secondary 得分"""
+        """primary 不同、reasoning 不同、secondary 部分重合 → 仅 secondary 得分（0.1 权重）"""
         result = score_embedding(
             parse_output(teacher_factory(primary_intent="SEXUAL_INTENT", secondary_intents=["A", "B"], reasoning="first reasoning text")),
             parse_output(teacher_factory(primary_intent="COMPANIONSHIP", secondary_intents=["A"], reasoning="second different reasoning")),
             parse_prompt(prompt_factory()),
             mock_embedder,
         )
-        # 0.5*0(枚举) + 0.2*(1/2 jaccard) + 0.3*0(reasoning 正交)
-        assert result.intent_score == pytest.approx(0.2 * 0.5, abs=1e-3)
+        # 0.8*0(primary 不一致) + 0.1*(1/2 jaccard) + 0.1*0(reasoning 正交)
+        assert result.intent_score == pytest.approx(0.1 * 0.5, abs=1e-3)
+
+    def test_intent_primary_match_reasoning_missing(self, teacher_factory, prompt_factory, mock_embedder):
+        """primary 一致但 reasoning 缺失（student 只写 primary）→ 保底 0.8 + secondary 加分"""
+        result = score_embedding(
+            parse_output(teacher_factory(primary_intent="SEXUAL_INTENT", secondary_intents=[], reasoning="some evidence text")),
+            parse_output(teacher_factory(primary_intent="SEXUAL_INTENT", secondary_intents=[])),
+            parse_prompt(prompt_factory()),
+            mock_embedder,
+        )
+        # mock_embedder 对缺失 reasoning：cosine(空, ...) = 0 → 0.8*1 + 0.1*1(jaccard 都空) + 0.1*0 = 0.9
+        assert result.intent_score == pytest.approx(0.9, abs=1e-3)
 
     def test_other_full_score(self, teacher_factory, prompt_factory, mock_embedder):
         result = score_embedding(

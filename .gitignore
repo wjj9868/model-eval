@@ -23,6 +23,9 @@ data/*.state.json
 data/*.png
 # 划分产物同样涉密（仅保留 split_manifest.json 统计清单）
 data/split/*.jsonl
+# 评测低分观测（含模型输出原文与用户对话，涉密）
+obs_*.jsonl
+data/compare/*.jsonl
 
 # 训练产出（LoRA 适配器 / 合并权重）
 models/

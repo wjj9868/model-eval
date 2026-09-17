@@ -317,19 +317,31 @@ def run_generation(args, samples: list[dict], system_prompt: str | None,
 
 def read_students(path: str | None, limit: int) -> tuple[list[str], list[str | None]]:
     """读取落盘的模型输出（供 stage=score 复用，避免重复推理）；截断行同样按失败降级为空文本"""
+    students, finish_reasons, _ = load_dump(path, limit)
+    return students, finish_reasons
+
+
+def load_dump(path: str | None, limit: int) -> tuple[list[str], list[str | None], list[str]]:
+    """读 dump 文件：返回 (降级 student, finish_reason, 原始输出原文)。
+
+    原始输出保留截断前的完整文本（供观测排查"没输出"vs"被截断"两类失败）；
+    降级 student 用于评分（截断按线上语义记空文本 → 全 0）。
+    """
     if not path:
         raise SystemExit("stage=score 需要 --dump-outputs 指向已有的模型输出文件")
     students: list[str] = []
     finish_reasons: list[str | None] = []
+    raw_students: list[str] = []
     with open(path, "r", encoding="utf-8") as fin:
         for line in fin:
             row = json.loads(line)
             finish = row.get("finish_reason")
             finish_reasons.append(finish)
+            raw_students.append(row["student"])
             students.append("" if finish == "length" else row["student"])
     if len(students) < limit:
         raise SystemExit(f"模型输出条数不足：{len(students)} < {limit}")
-    return students[:limit], finish_reasons[:limit]
+    return students[:limit], finish_reasons[:limit], raw_students[:limit]
 
 
 # 每个打分进程内复用的 embedder（懒加载，避免重复载入模型）
@@ -409,29 +421,41 @@ def print_report(results: list[dict], tag: str, args) -> None:
 
 
 def write_observations(path: str, samples: list[dict], students: list[str],
-                       finish_reasons: list[str | None], results: list[dict]) -> None:
-    """只落盘高风险样本的关键信息，供人工逐条排查失败模式。
+                       finish_reasons: list[str | None], results: list[dict],
+                       raw_students: list[str] | None = None) -> None:
+    """落盘"任一分项低分或异常"样本的关键信息，供人工逐条排查失败模式。
 
-    高风险 = json_valid<1.0 / intent<0.6 / 截断。每行含：
-      why（失败原因标记）、scores、checks（json 失败时的 L1 检查明细，
-      直接定位是字段缺失/分类非法/超长/重复中哪一项）、
-      prompt_excerpt（前 300 字符足够定位场景）、teacher / student 原文对照。
+    风险判定覆盖所有维度（不只 json/intent/截断）：
+      json_valid<1 / intent<0.6 / memory P或R<0.6 / speaker<0.6 / summary<0.6 /
+      other<0.6 / hallucination_penalty>0.2 / 截断。
+    每行含：why（失败原因标记）、scores、checks（json 失败时的 L1 检查明细）、
+    prompt_excerpt（前 300 字符）、teacher / student 原文对照，
+    以及 student_raw（**原始输出**——截断样本的原文，区分"没输出"vs"被截断"）。
     """
-    n_json = n_intent = n_trunc = 0
+    n_json = n_intent = n_trunc = n_other = 0
     with open(path, "w", encoding="utf-8") as fout:
         for i, (record, student, payload) in enumerate(zip(samples, students, results)):
             json_fail = payload["json_valid"] != 1.0
             intent_low = payload["intent_score"] is not None and payload["intent_score"] < 0.6
             truncated = finish_reasons[i] == "length"
-            if not (json_fail or intent_low or truncated):
+            # 其它分项低分（None 不适用忽略）；幻觉 >0.2 视为高发
+            low_other = [
+                key for key in ("memory_precision", "memory_recall", "speaker_attribution",
+                                "summary_score", "other")
+                if payload.get(key) is not None and payload[key] < 0.6
+            ] + (["hallucination_high"] if payload.get("hallucination_penalty") is not None
+                 and payload["hallucination_penalty"] > 0.2 else [])
+            if not (json_fail or intent_low or truncated or low_other):
                 continue
             n_json += 1 if json_fail else 0
             n_intent += 1 if intent_low else 0
             n_trunc += 1 if truncated else 0
+            n_other += 1 if low_other else 0
+            why = [k for k, flag in (("json_invalid", json_fail), ("intent_low", intent_low),
+                                     ("truncated", truncated)) if flag] + low_other
             row = {
                 "sample_id": i,
-                "why": [k for k, flag in (("json_invalid", json_fail), ("intent_low", intent_low),
-                                          ("truncated", truncated)) if flag],
+                "why": why,
                 "scores": {k: payload[k] for k in DIMENSIONS if payload[k] is not None},
                 "finish_reason": finish_reasons[i],
                 # json 丢分时最有用的定位：具体哪个 L1 结构检查没通过
@@ -440,10 +464,13 @@ def write_observations(path: str, samples: list[dict], students: list[str],
                 "prompt_excerpt": record["prompt"][:300],
                 "teacher": record["output"],
                 "student": student,
+                # 原始模型输出（截断样本此处保留截断前全文，评分用 student 为空）
+                "student_raw": raw_students[i] if raw_students else student,
             }
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-    print(f"观测文件已保存：{path}（高风险共 {n_json + n_intent + n_trunc} 条："
-          f"json_valid<1.0: {n_json}，intent<0.6: {n_intent}，截断: {n_trunc}）", flush=True)
+    print(f"观测文件已保存：{path}（高风险共 {n_json + n_intent + n_trunc + n_other} 条："
+          f"json_valid<1: {n_json}，intent<0.6: {n_intent}，截断: {n_trunc}，"
+          f"其它低分: {n_other}）", flush=True)
 
 
 def main() -> None:
@@ -466,12 +493,18 @@ def main() -> None:
     if args.stage in ("generate", "both"):
         students, finish_reasons = run_generation(args, samples, system_prompt, response_schema)
     if args.stage in ("score", "both"):
+        raw_students: list[str] | None = None
         if students is None:
-            students, finish_reasons = read_students(args.dump_outputs, len(samples))
+            students, finish_reasons, raw_students = load_dump(args.dump_outputs, len(samples))
+        else:
+            # 生成后直接打分：dump 已含原始输出，重新读一份供观测使用
+            if args.dump_observations and args.dump_outputs:
+                _, _, raw_students = load_dump(args.dump_outputs, len(samples))
         results = run_scoring(args, samples, students, tag, finish_reasons)
         print_report(results, tag, args)
         if args.dump_observations:
-            write_observations(args.dump_observations, samples, students, finish_reasons, results)
+            write_observations(args.dump_observations, samples, students, finish_reasons, results,
+                               raw_students)
 
 
 if __name__ == "__main__":

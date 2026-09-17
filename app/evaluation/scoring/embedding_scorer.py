@@ -351,7 +351,11 @@ def _summary_score(teacher: AnalysisResult, student: AnalysisResult, cache: _Vec
 
 
 def _intent_score(teacher: AnalysisResult, student: AnalysisResult, cache: _VectorCache) -> float:
-    """user_intent 评分：primary 枚举 0.5 + secondary 集合 Jaccard 0.2 + reasoning 语义 0.3。
+    """user_intent 评分：primary 枚举 0.8 + secondary 集合 Jaccard 0.1 + reasoning 语义 0.1。
+
+    primary_intent 是意图识别的核心信号（业务上主判断依据），权重占绝对主导：
+    只要 primary 一致即得 0.8 基础分，secondary / reasoning 仅作小幅加分（区分细粒度质量）。
+    历史口径为 0.5/0.2/0.3（primary 一致但 reasoning 缺失时只得分 0.5，被认为过度惩罚）。
 
     secondary_intents 非 schema 必填字段，teacher 常为空（实测 81%）。Jaccard 规则与 memory P/R 对齐：
     双方都空 → 1.0（一致地"无次要意图"）；仅一方为空 → 0.0（不一致）。
@@ -371,7 +375,7 @@ def _intent_score(teacher: AnalysisResult, student: AnalysisResult, cache: _Vect
     s_reason = s_intent.get("reasoning")
     reasoning_sim = cache.cosine(s_reason, t_reason) if isinstance(s_reason, str) and s_reason.strip() else 0.0
 
-    return round(0.5 * enum_match + 0.2 * jaccard + 0.3 * max(0.0, reasoning_sim), 4)
+    return round(0.8 * enum_match + 0.1 * jaccard + 0.1 * max(0.0, reasoning_sim), 4)
 
 
 def _other_score(teacher: AnalysisResult, student: AnalysisResult, cache: _VectorCache) -> float:
