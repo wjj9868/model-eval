@@ -88,7 +88,7 @@ def wait_ready(log_path: Path, timeout: int = 600) -> str:
     raise SystemExit(f"vLLM 服务 {timeout}s 未就绪，看日志：{log_path}")
 
 
-def evaluate_base(cfg: dict, args, base_all: list, dump: Path, scores: Path) -> None:
+def evaluate_base(cfg: dict, args, dump: Path, scores: Path) -> None:
     """单个基座模型：起 vLLM → 生成 → 停 → 打分（GPU 打分）"""
     venv_vllm = args.vllm_venv
     venv_train = args.train_venv
@@ -196,15 +196,8 @@ def main() -> None:
         if not rescore_existing(dump, scores, args, obs_path=extra_obs):
             print(f"跳过 smoke/lora 汇总依赖：{key}", flush=True)
 
-    # 2) 基座 2B/4B 评测（可断点：目标分数存在则跳过）
+    # 2) 基座 2B/4B 评测（可断点：目标分数存在则跳过）；args Namespace 即全部配置，无需另建 dict
     selected = [m for m in BASE_MODELS if m["label"] in (args.base_only or "").split(",") or not args.base_only]
-    run_cfg = {
-        "test_file": args.test_file, "limit": args.limit, "max_model_len": args.max_model_len,
-        "gpu_mem": args.gpu_mem, "timeout": args.timeout, "concurrency": args.concurrency,
-        "device": args.device, "vllm_venv": args.vllm_venv, "train_venv": args.train_venv,
-        "eval_script": args.eval_script, "out_dir": args.out_dir,
-        "max_new_tokens": args.max_new_tokens,
-    }
     if not args.skip_base:
         for cfg in selected:
             dump = args.out_dir / f"{cfg['label']}_dump.jsonl"
@@ -212,7 +205,7 @@ def main() -> None:
             if scores.exists():
                 print(f"已存在 {scores}，跳过 {cfg['label']}", flush=True)
                 continue
-            evaluate_base(cfg, run_cfg, args, dump, scores)
+            evaluate_base(cfg, args, dump, scores)
     else:
         print("--skip-base：跳过基座评测", flush=True)
 
