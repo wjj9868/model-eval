@@ -89,23 +89,35 @@ def wait_ready(log_path: Path, timeout: int = 600) -> str:
 
 
 def evaluate_base(cfg: dict, args, dump: Path, scores: Path) -> None:
-    """单个基座模型：起 vLLM → 生成 → 停 → 打分（GPU 打分）"""
-    venv_vllm = args.vllm_venv
+    """单个基座模型：起 vLLM → 生成 → 停 → 打分（GPU 打分）。
+
+    --manual-server 时服务由用户手动起/停（脚本后台启动在某些 Linux 上不生效）：
+    脚本只等待 8000 已有服务 → 生成 → 等待用户手动停服务（可交互，or 直接 score 前探测端口空闲）。
+    打分阶段 GPU 打分需要服务已停（显存冲突），故手动模式统一 --device cpu。
+    """
     venv_train = args.train_venv
     eval_script = args.eval_script
     log = args.out_dir / f"vllm_{cfg['label']}.log"
 
-    wait_port_free(8000)
-    start_cmd = (
-        f"source {venv_vllm}/bin/activate && "
-        "VLLM_USE_FLASHINFER_SAMPLER=0 nohup vllm serve "
-        f"{cfg['name']} --served-model-name {cfg['served']} "
-        f"--max-model-len {args.max_model_len} --port 8000 --gpu-memory-utilization {args.gpu_mem} "
-        f"> {log} 2>&1 &"
-    )
-    if not sh(start_cmd):
-        raise SystemExit(f"vLLM 启动失败：{cfg['label']}，看 {log}")
-    served_id = wait_ready(log)
+    if args.manual_server:
+        print(f"\n[{cfg['label']}] 手动模式：请自行启动 vLLM 服务后按回车继续，或我等它就绪…", flush=True)
+        try:
+            input(f"[{cfg['label']}] 启动服务：{cfg['name']}（无忽略）…")  # 等待用户回车确认已起
+        except (EOFError, KeyboardInterrupt):
+            pass
+        served_id = wait_ready(log)
+    else:
+        wait_port_free(8000)
+        start_cmd = (
+            f"source {args.vllm_venv}/bin/activate && "
+            "VLLM_USE_FLASHINFER_SAMPLER=0 nohup vllm serve "
+            f"{cfg['name']} --served-model-name {cfg['served']} "
+            f"--max-model-len {args.max_model_len} --port 8000 --gpu-memory-utilization {args.gpu_mem} "
+            f"> {log} 2>&1 &"
+        )
+        if not sh(start_cmd):
+            raise SystemExit(f"vLLM 启动失败：{cfg['label']}，看 {log}")
+        served_id = wait_ready(log)
 
     gen_ok = sh(
         f"{venv_train}/bin/python {eval_script} --backend openai --base-url {BASE_URL} "
@@ -114,17 +126,25 @@ def evaluate_base(cfg: dict, args, dump: Path, scores: Path) -> None:
         f"--max-new-tokens {args.max_new_tokens} --dump-outputs {dump} "
         f"--timeout {args.timeout} --concurrency {args.concurrency}"
     )
-    # 无论生成成败都停服务（释放显存供打分）
-    sh(f"pkill -f 'vllm serve' || true")
-    wait_port_free(8000)
     if not gen_ok:
         raise SystemExit(f"生成失败：{cfg['label']}，dump 未产出可打分内容")
-    print(f"生成完成：{cfg['label']}（dump={dump}），开始打分…", flush=True)
+    print(f"生成完成：{cfg['label']}（dump={dump}）", flush=True)
 
+    if args.manual_server:
+        print(f"[{cfg['label']}] 请手动停止 vLLM 服务（释放显存）后按回车继续打分…", flush=True)
+        try:
+            input("就绪后回车继续（打分走 CPU）…")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    else:
+        sh(f"pkill -f 'vllm serve' || true")
+        wait_port_free(8000)
+
+    score_device = "cpu" if args.manual_server else args.device
     if not sh(
         f"{venv_train}/bin/python {eval_script} --backend openai "
         f"--stage score --input {args.test_file} --limit {args.limit} "
-        f"--dump-outputs {dump} --out {scores} --device {args.device}"
+        f"--dump-outputs {dump} --out {scores} --device {score_device}"
     ):
         raise SystemExit(f"打分失败：{cfg['label']}（out={scores}）")
 
@@ -150,6 +170,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--title", default="Qwen3.5 2B vs 4B vs 蒸馏 评测对比")
     p.add_argument("--skip-base", action="store_true", help="跳过基座评测（仅汇总已存在的分数文件）")
     p.add_argument("--base-only", default=None, help="只跑指定基座（如 base_2b），逗号分隔")
+    p.add_argument("--manual-server", action="store_true",
+                   help="基座 vLLM 由你自己启动/停止（脚本后台启动在部分环境不生效；交互式等回车），打分自动转 CPU")
     return p.parse_args()
 
 
