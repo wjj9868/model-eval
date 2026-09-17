@@ -1,18 +1,29 @@
 # @author: ztwz
-"""Embedding 客户端：bge-small-zh-v1.5（中英混合，CPU 可跑）。
+"""Embedding 客户端：默认 bge-small-en-v1.5（英文语料，CPU 可跑）。
+
+语料为纯英文，故默认改用英文优化模型；与旧的 bge-small-zh-v1.5 同族、同 384 维、
+同 L2 归一化约定，是真正的 drop-in，下游无需任何维度适配。
+中文语料可用环境变量 MODEL_EVAL_EMBEDDING_MODEL 切回 BAAI/bge-small-zh-v1.5；
+中英混合且需兼顾则换多语言模型（如 BAAI/bge-m3）。
+注意：换模型后 cosine 分布会变，embedding_scorer 的相似度阈值必须同步重标定。
 
 sentence-transformers 懒加载；模型优先 HF 本地缓存，缺失时 modelscope 兜底下载。
 """
 from __future__ import annotations
 
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+import os
+
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+# 覆盖模型名的环境变量（沿用例：MODEL_EVAL_ 前缀）
+EMBEDDING_MODEL_ENV = "MODEL_EVAL_EMBEDDING_MODEL"
 
 
 class EmbeddingClient:
     """encode(texts) 返回 L2 归一化后的向量矩阵 (n, dim)"""
 
-    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, device: str | None = None):
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = None, device: str | None = None):
+        # 显式入参 > 环境变量 > 内置默认（en）
+        self.model_name = model_name or os.environ.get(EMBEDDING_MODEL_ENV) or DEFAULT_EMBEDDING_MODEL
         self.device = device
         self._model = None
 

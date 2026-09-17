@@ -7,6 +7,7 @@ EmbeddingClient）。文本统一批量编码并按原文缓存向量，避免�
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -16,11 +17,35 @@ from app.evaluation.output_parser import AnalysisResult, memory_items, normalize
 from app.evaluation.prompt_parser import PromptContext
 from app.evaluation.scoring.schemas import MemoryItemDetail
 
+
+def _env_float(name: str, default: float) -> float:
+    """从环境变量读阈值（MODEL_EVAL_ 前缀）；缺失或非法则回退默认值。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# 以下阈值与 embedding 模型强耦合，换模型必须同步重标定（环境变量可覆盖）。
+# 当前默认值对应 bge-small-en-v1.5，标定方法：取 200 条 lora 样本，
+# 对 memory 配对 / grounding 配对分别算两模型 cosine 分布，做**等命中率**换算
+# （保持评分器判定选择性不变），得到 0.85→0.88、0.60→0.57、0.80→0.80。
+# 若用 MODEL_EVAL_EMBEDDING_MODEL 切回 zh 模型，需同时把阈值切回 0.85/0.80/0.60。
+# 词覆盖率阈值语言无关（英文整词切分），换模型无需调整。
 # 语义等价判定阈值（cosine），可由调用方校准覆盖
-DEFAULT_SEMANTIC_THRESHOLD = 0.85
+DEFAULT_SEMANTIC_THRESHOLD = _env_float("MODEL_EVAL_SEMANTIC_THRESHOLD", 0.88)
 # 证据分级阈值：(embedding 相似度, 词覆盖率) 任一超过即认定
-GROUNDING_STRONG = (0.80, 0.60)  # → 1.0 明确支持
-GROUNDING_WEAK = (0.60, 0.30)  # → 0.5 可推导
+GROUNDING_STRONG = (  # → 1.0 明确支持
+    _env_float("MODEL_EVAL_GROUNDING_STRONG_SIM", 0.80),
+    _env_float("MODEL_EVAL_GROUNDING_STRONG_OVERLAP", 0.60),
+)
+GROUNDING_WEAK = (  # → 0.5 可推导
+    _env_float("MODEL_EVAL_GROUNDING_WEAK_SIM", 0.57),
+    _env_float("MODEL_EVAL_GROUNDING_WEAK_OVERLAP", 0.30),
+)
 # 证据级别常量（_evidence_level 的三档取值，归因判定用）
 GROUNDING_WEAK_LEVEL = 0.5
 GROUNDING_STRONG_LEVEL = 1.0
