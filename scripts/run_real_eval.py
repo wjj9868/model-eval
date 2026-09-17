@@ -76,6 +76,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--out", default="data/real_eval_scores.jsonl")
     p.add_argument("--dump-outputs", default=None, help="模型原始输出另存 JSONL（涉密，默认关闭）")
+    p.add_argument("--dump-observations", default=None,
+                   help="观测文件 JSONL：只落盘高风险样本（json_valid<1.0 / intent<0.6 / 截断）的"
+                        "关键信息（scores + checks 定位 + teacher/student 对照 + prompt 前300字符），涉密，默认关闭")
     p.add_argument("--require-schema", action="store_true",
                    help="只评测 prompt 含完整六字段 schema 的样本（口径可比）")
     p.add_argument("--temperature", type=float, default=1.0,
@@ -405,6 +408,44 @@ def print_report(results: list[dict], tag: str, args) -> None:
     print(f"截断失败（finish_reason=length，按线上语义计 0 分）: {truncated}/{len(results)}")
 
 
+def write_observations(path: str, samples: list[dict], students: list[str],
+                       finish_reasons: list[str | None], results: list[dict]) -> None:
+    """只落盘高风险样本的关键信息，供人工逐条排查失败模式。
+
+    高风险 = json_valid<1.0 / intent<0.6 / 截断。每行含：
+      why（失败原因标记）、scores、checks（json 失败时的 L1 检查明细，
+      直接定位是字段缺失/分类非法/超长/重复中哪一项）、
+      prompt_excerpt（前 300 字符足够定位场景）、teacher / student 原文对照。
+    """
+    n_json = n_intent = n_trunc = 0
+    with open(path, "w", encoding="utf-8") as fout:
+        for i, (record, student, payload) in enumerate(zip(samples, students, results)):
+            json_fail = payload["json_valid"] != 1.0
+            intent_low = payload["intent_score"] is not None and payload["intent_score"] < 0.6
+            truncated = finish_reasons[i] == "length"
+            if not (json_fail or intent_low or truncated):
+                continue
+            n_json += 1 if json_fail else 0
+            n_intent += 1 if intent_low else 0
+            n_trunc += 1 if truncated else 0
+            row = {
+                "sample_id": i,
+                "why": [k for k, flag in (("json_invalid", json_fail), ("intent_low", intent_low),
+                                          ("truncated", truncated)) if flag],
+                "scores": {k: payload[k] for k in DIMENSIONS if payload[k] is not None},
+                "finish_reason": finish_reasons[i],
+                # json 丢分时最有用的定位：具体哪个 L1 结构检查没通过
+                "checks": (payload.get("details", {}).get("rule", {}).get("checks")
+                           if json_fail else None),
+                "prompt_excerpt": record["prompt"][:300],
+                "teacher": record["output"],
+                "student": student,
+            }
+            fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"观测文件已保存：{path}（高风险共 {n_json + n_intent + n_trunc} 条："
+          f"json_valid<1.0: {n_json}，intent<0.6: {n_intent}，截断: {n_trunc}）", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     global _EMBED_DEVICE
@@ -429,6 +470,8 @@ def main() -> None:
             students, finish_reasons = read_students(args.dump_outputs, len(samples))
         results = run_scoring(args, samples, students, tag, finish_reasons)
         print_report(results, tag, args)
+        if args.dump_observations:
+            write_observations(args.dump_observations, samples, students, finish_reasons, results)
 
 
 if __name__ == "__main__":
