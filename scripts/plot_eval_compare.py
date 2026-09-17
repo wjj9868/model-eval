@@ -35,18 +35,59 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from pathlib import Path
 from statistics import mean, median, stdev
 
 import matplotlib
 
 matplotlib.use("Agg")  # 无显示环境必须显式指定后端，故 import 顺序后置
+from matplotlib import font_manager  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-# 中文字体：matplotlib 对 Noto CJK 的 .ttc 只注册首个 face（名字为 "Noto Sans CJK JP"），
-# 该 face 含 CJK 统一汉字，可正常渲染简体中文；均缺失时退回默认字体
+
+def _register_simplified_cjk() -> str | None:
+    """让中文按**简体字形**渲染，返回注册到 matplotlib 的字体名（失败返回 None）。
+
+    坑：Noto CJK 以 .ttc 集合发布，matplotlib 只注册集合里的**首个 face**（本机为
+    "Noto Sans CJK JP"）；fontconfig 里虽有 "Noto Sans CJK SC"，matplotlib 却找不到它，
+    findfont 会静默回退 DejaVu —— 结果图上所有汉字都按**日文字形**绘制，"径 / 骨 / 直 /
+    真"等笔画与简体规范不一致（实测 U+5F84「径」JP 面与 SC 面位图相差 843 px）。
+    这里用 fontTools 把 SC face 抽成独立字体文件缓存到 ~/.cache（首次一次性，约十几 MB），
+    再 addfont 注册；任何环节失败都退回 JP 面，不影响出图。
+    """
+    cache = Path.home() / ".cache" / "mpl-cjk-sc" / "NotoSansCJKsc-Regular.otf"
+    try:
+        if not cache.exists():
+            from fontTools.ttLib import TTCollection  # 仅首次抽取时依赖 fontTools
+            for ttc in sorted(Path("/usr/share/fonts").rglob("*CJK*Regular.ttc")):
+                coll = TTCollection(str(ttc))
+                target = next((f for f in coll.fonts
+                               if f["name"].getDebugName(4) == "Noto Sans CJK SC"), None)
+                if target is not None:
+                    cache.parent.mkdir(parents=True, exist_ok=True)
+                    target.save(str(cache))
+                    print(f"已抽取简体字体面 → {cache}（首次一次性，之后复用）")
+                    coll.close()
+                    break
+                coll.close()
+        font_manager.fontManager.addfont(str(cache))
+        return "Noto Sans CJK SC"
+    except Exception as exc:  # 字体抽取/注册失败不应阻断出图
+        print(f"警告：简体字体不可用（{exc}），中文将按 JP 字形渲染")
+        return None
+
+
+# 中文字体：优先简体 SC 面（由上方函数抽取并注册），失败退回 JP 面，再失败退回默认字体
+_SC_FONT = _register_simplified_cjk()
 plt.rcParams["font.sans-serif"] = [
-    "Noto Sans CJK JP", "Noto Sans CJK SC", "Noto Serif CJK JP", "DejaVu Sans",
+    *([_SC_FONT] if _SC_FONT else []),
+    "Noto Sans CJK JP", "Noto Serif CJK JP", "DejaVu Sans",
+]
+# 等宽字体默认只有 DejaVu Sans Mono（无汉字字形）→ 用它写中文会整片渲染成方块（乱码）。
+# matplotlib 3.6+ 支持按 family 列表逐字回退，故把 CJK 字体追加进去做兜底。
+plt.rcParams["font.monospace"] = [
+    "DejaVu Sans Mono", "Noto Sans Mono CJK JP", "Noto Sans CJK JP", "Noto Sans CJK SC",
 ]
 plt.rcParams["axes.unicode_minus"] = False
 
@@ -164,6 +205,11 @@ def grouped_bars(ax, x, series_values: list[list[float]], labels: list[str],
         ax.set_ylim(0, ylim)
 
 
+def legend_compact(ax, ncol: int = 3, loc: str = "upper center") -> None:
+    """图例：小字号多列紧凑排布；配合各面板 ylim 预留的顶部留白，避免压住柱子（曲线可达 5~6 条）"""
+    ax.legend(fontsize=6.5, ncol=ncol, loc=loc, framealpha=0.85, borderpad=0.25)
+
+
 def win_rate_matrix(rows_list: list[list[dict]]) -> np.ndarray:
     """两两逐条胜率矩阵：m[i][j] = 曲线 i 在公共前缀内总分严格高于 j 的样本占比"""
     n = len(rows_list)
@@ -182,73 +228,50 @@ def win_rate_matrix(rows_list: list[list[dict]]) -> np.ndarray:
 
 def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
            baseline: int, args) -> None:
-    """渲染综合分析图：1~14 面板用公共前缀对齐口径，15 表用各自全量，16 为读图说明"""
+    """渲染综合分析图（3 行 × 4 列网格，共 10 面板）：①~⑧ 用公共前缀对齐口径，
+    ⑨ 汇总表为各自全量，⑩ 读图说明跨 2~4 列。
+
+    变量名 axN 沿用历史编号（多轮删面板后已不连续），**以 set_title 内的圈号为最终面板号**。
+    """
     n_common = len(aligned[0])
     colors = [SERIES_COLORS[i % len(SERIES_COLORS)] for i in range(len(labels))]
     sizes = " / ".join(f"{s['label']}={len(s['rows'])}" for s in series)
 
-    fig = plt.figure(figsize=(24, 18))
+    fig = plt.figure(figsize=(24, 13.5))  # 3 行 × 4 列：行高对齐旧 4×4，纵向更紧凑
+    gs = fig.add_gridspec(3, 4)  # 用网格而非序号定位：⑩ 说明面板可跨列加宽，长文本不再被截断
     fig.suptitle(
         f"{args.title}\n各曲线样本量：{sizes}；图内面板统一取公共前缀 n={n_common} 对齐",
         fontsize=16,
     )
 
     # 1) 各维度均值对比
-    ax1 = fig.add_subplot(4, 4, 1)
+    ax1 = fig.add_subplot(gs[0, 0])
     x = np.arange(len(DIMENSIONS))
     means = [[mean_over_applicable([dim_value(r, k) for r in rows]) for k, _ in DIMENSIONS]
              for rows in aligned]
-    grouped_bars(ax1, x, means, labels, ylim=1.05)
+    grouped_bars(ax1, x, means, labels, ylim=1.35)
     ax1.set_xticks(x)
     ax1.set_xticklabels([name for _, name in DIMENSIONS], rotation=40, ha="right", fontsize=8)
     ax1.set_ylabel("均值")
-    ax1.set_title("① 各维度均值（不适用维度已剔除）")
-    ax1.legend(fontsize=7)
+    ax1.set_title("① 各维度均值")
+    legend_compact(ax1, 5)
     ax1.grid(axis="y", alpha=0.3)
 
-    # 2) 总分均值 ± 95% CI
-    ax2 = fig.add_subplot(4, 4, 2)
+    # 2) 总分 ECDF（越靠右越好；取代原"均值±CI"与"箱线图"，尾部信息更全）
+    ax3 = fig.add_subplot(gs[0, 1])
     totals = [[r["total_score"] for r in rows] for rows in aligned]
-    vals = [mean(t) for t in totals]
-    errs = [ci95(t) for t in totals]
-    ax2.bar(range(len(labels)), vals, yerr=errs, capsize=4, color=colors)
-    for i, (value, err) in enumerate(zip(vals, errs)):
-        ax2.text(i, value + err + 0.015, f"{value:.3f}", ha="center", fontsize=8)
-    ax2.set_xticks(range(len(labels)))
-    ax2.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax2.set_ylim(0, 1.12)
-    ax2.set_ylabel("总分均值")
-    ax2.set_title(f"② 总分均值±95%CI（n={n_common}）")
-    ax2.grid(axis="y", alpha=0.3)
-
-    # 3) 总分 ECDF（比直方图更易看尾部与超越点）
-    ax3 = fig.add_subplot(4, 4, 3)
     for i, (t, label) in enumerate(zip(totals, labels)):
         ordered = np.sort(t)
         ax3.step(ordered, np.arange(1, len(ordered) + 1) / len(ordered),
                  where="post", label=label, color=colors[i])
     ax3.set_xlabel("总分")
     ax3.set_ylabel("累积占比")
-    ax3.set_title("③ 总分 ECDF")
-    ax3.legend(fontsize=7)
+    ax3.set_title("② 总分 ECDF（越右越好）")
+    ax3.legend(fontsize=6.5, loc="upper left", framealpha=0.85)
     ax3.grid(alpha=0.3)
 
-    # 4) 总分箱线图（看中位数与离散度）
-    ax4 = fig.add_subplot(4, 4, 4)
-    # 不传 labels=（matplotlib 3.9 起已弃用），刻度标签单独设置，兼容新旧版本
-    bp = ax4.boxplot(totals, patch_artist=True, showfliers=True)
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.7)
-    for median_line in bp["medians"]:
-        median_line.set_color("black")
-    ax4.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax4.set_ylabel("总分")
-    ax4.set_title("④ 总分分布箱线")
-    ax4.grid(axis="y", alpha=0.3)
-
-    # 5) json_valid 四档占比（0 / 0.25 字段不全 / 0.5 有缺陷 / 1.0 全通过）
-    ax5 = fig.add_subplot(4, 4, 5)
+    # 3) json_valid 四档占比（0 / 0.25 字段不全 / 0.5 有缺陷 / 1.0 全通过）
+    ax5 = fig.add_subplot(gs[0, 2])
     levels = [0.0, 0.25, 0.5, 1.0]
     level_names = ["0 无效", "0.25 字段不全", "0.5 有缺陷", "1.0 全通过"]
     level_colors = ["#E45756", "#F58518", "#F2CF5B", "#54A24B"]
@@ -260,83 +283,22 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         bottom += shares
     ax5.set_xticks(xs)
     ax5.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-    ax5.set_ylim(0, 1.0)
+    ax5.set_ylim(0, 1.30)  # 堆叠柱占满 0~1，顶部留白给图例
+    ax5.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
     ax5.set_ylabel("占比")
-    ax5.set_title("⑤ JSON 结构分档占比")
-    ax5.legend(fontsize=7, loc="lower right")
+    ax5.set_title("③ JSON 结构分档占比")
+    legend_compact(ax5, 2)
     ax5.grid(axis="y", alpha=0.3)
 
-    # 6) 规则断言通过率
-    ax6 = fig.add_subplot(4, 4, 6)
-    x6 = np.arange(len(CHECK_NAMES))
-    rates = [[check_rate(rows, k) for k, _ in CHECK_NAMES] for rows in aligned]
-    grouped_bars(ax6, x6, rates, labels, ylim=1.05)
-    ax6.set_xticks(x6)
-    ax6.set_xticklabels([n for _, n in CHECK_NAMES], rotation=30, ha="right", fontsize=8)
-    ax6.set_ylabel("通过率")
-    ax6.set_title("⑥ L1 规则断言通过率")
-    ax6.legend(fontsize=7)
-    ax6.grid(axis="y", alpha=0.3)
+    # 已删面板（历史留痕）：
+    #   "L1 规则断言通过率"——五条断言互差 ≤0.005，恒等于 ③ 的 1.0 档；
+    #   "关键指标（总分均值/JSON 全通过/截断率）"——分别等于 ① 的总分组、③ 的绿档与红档
+    #   （实测 json_valid=0 占比 ≡ 截断率）。两者逐条数值仍在控制台 summarize() 打印。
 
-    # 7) 关键指标：总分均值 / JSON 全通过 / 截断率
-    ax7 = fig.add_subplot(4, 4, 7)
-    keys = ["总分均值", "JSON 全通过", "截断率"]
-    kvals = [[mean([r["total_score"] for r in rows]),
-              json_share(rows, 1.0),
-              trunc_rate(rows)] for rows in aligned]
-    x7 = np.arange(len(keys))
-    grouped_bars(ax7, x7, kvals, labels, ylim=1.12)
-    ax7.set_xticks(x7)
-    ax7.set_xticklabels(keys)
-    ax7.set_title("⑦ 关键指标")
-    ax7.legend(fontsize=7)
-    width = 0.8 / len(labels)
-    for i, series_vals in enumerate(kvals):
-        offset = (i - (len(labels) - 1) / 2) * width
-        for xi, value in enumerate(series_vals):
-            ax7.text(xi + offset, value + 0.02, f"{value:.2f}", ha="center", fontsize=7)
-    ax7.grid(axis="y", alpha=0.3)
-
-    # 8) 幻觉惩罚（越低越好）与 grounding 证据均值（越高越好）
-    ax8 = fig.add_subplot(4, 4, 8)
-    penalty = [mean_over_applicable([dim_value(r, "hallucination_penalty") for r in rows])
-               for rows in aligned]
-    grounding = [mean_over_applicable([dim_value(r, "grounding_mean") for r in rows])
-                 for rows in aligned]
-    x8 = np.arange(2)
-    # 分组柱：每组 2 根（幻觉惩罚率 / grounding 均值），曲线作为颜色
-    width8 = 0.8 / len(labels)
-    for i, label in enumerate(labels):
-        offset = (i - (len(labels) - 1) / 2) * width8
-        ax8.bar(x8 + offset, [penalty[i], grounding[i]], width8, label=label, color=colors[i])
-    for i in range(len(labels)):
-        offset = (i - (len(labels) - 1) / 2) * width8
-        ax8.text(0 + offset, penalty[i] + 0.02, f"{penalty[i]:.2f}", ha="center", fontsize=7)
-        ax8.text(1 + offset, grounding[i] + 0.02, f"{grounding[i]:.2f}", ha="center", fontsize=7)
-    ax8.set_xticks(x8)
-    ax8.set_xticklabels(["幻觉惩罚↓", "grounding↑"])
-    ax8.set_ylim(0, 1.12)
-    ax8.set_title("⑧ 幻觉惩罚与证据均值")
-    ax8.legend(fontsize=7)
-    ax8.grid(axis="y", alpha=0.3)
-
-    # 9) 同一样本逐条对比散点：以基线为横轴，对角线=持平，点在对角线上方=该曲线更好
-    ax9 = fig.add_subplot(4, 4, 9)
-    base_totals = totals[baseline]
-    for i, label in enumerate(labels):
-        if i == baseline:
-            continue
-        ax9.scatter(base_totals, totals[i], s=10, alpha=0.35, label=f"{label} vs {labels[baseline]}",
-                    color=colors[i])
-    ax9.plot([0, 1], [0, 1], linestyle="--", color="grey", linewidth=1)
-    ax9.set_xlabel(f"{labels[baseline]} 总分")
-    ax9.set_ylabel("各模型总分")
-    ax9.set_title(f"⑨ 同一样本逐条对比（相对 {labels[baseline]}）")
-    ax9.legend(fontsize=7)
-    ax9.grid(alpha=0.3)
-
-    # 10) 两两逐条胜率热力图
-    ax10 = fig.add_subplot(4, 4, 10)
+    # 4) 两两逐条胜率热力图（比逐条散点/直方图更紧凑，胜负一图看全）
+    #    注：矩阵严格反对称（win(i,j)+win(j,i)+平局=1），下三角与基准列/天花板行确有冗余，
+    #    但全矩阵便于直接对读任意两条曲线，故保留完整 5×5 展示。
+    ax10 = fig.add_subplot(gs[0, 3])
     matrix = win_rate_matrix(aligned)
     im = ax10.imshow(matrix, cmap="RdYlGn", vmin=0.0, vmax=1.0)
     ax10.set_xticks(range(len(labels)))
@@ -349,11 +311,11 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
                 ax10.text(j, i, "—", ha="center", va="center", fontsize=9)
             else:
                 ax10.text(j, i, f"{matrix[i, j]:.2f}", ha="center", va="center", fontsize=8)
-    ax10.set_title("⑩ 逐条胜率（行>列 的样本占比）")
+    ax10.set_title("④ 逐条胜率（行>列 的样本占比）")
     fig.colorbar(im, ax=ax10, fraction=0.046)
 
-    # 11) 各维度相对基线的差值（已统一为"正=更好"）
-    ax11 = fig.add_subplot(4, 4, 11)
+    # 6) 各维度相对基线的差值（已统一为"正=更好"）
+    ax11 = fig.add_subplot(gs[1, 1])
     delta_dims = [k for k, _ in DIMENSIONS]
     base_means = [mean_over_applicable([oriented(k, v) for v in
                                         [dim_value(r, k) for r in aligned[baseline]] if v is not None])
@@ -368,49 +330,51 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
             m = mean_over_applicable([oriented(k, v) for v in values if v is not None])
             diffs.append(m - base_means[delta_dims.index(k)])
         offset = (slot - (len(others) - 1) / 2) * width11
-        ax11.bar(x11 + offset, diffs, width11, label=f"{labels[i]} - {labels[baseline]}", color=colors[i])
+        # 图例只留曲线名：基线在所有条目里都一样，统一写进标题，避免长标签把图例挤出面板
+        ax11.bar(x11 + offset, diffs, width11, label=labels[i], color=colors[i])
     ax11.axhline(0, color="black", linewidth=0.8)
     ax11.set_xticks(x11)
     ax11.set_xticklabels([name for _, name in DIMENSIONS], rotation=40, ha="right", fontsize=8)
     ax11.set_ylabel("差值（正=更好）")
-    ax11.set_title("⑪ 各维度相对基线之差（幻觉已取补）")
-    ax11.legend(fontsize=7)
+    ax11.set_title(f"⑥ 各维度相对 {labels[baseline]} 之差（幻觉已取补）")
+    ax11.margins(y=0.22)  # 上下留白给图例与负向柱
+    legend_compact(ax11, 5)
     ax11.grid(axis="y", alpha=0.3)
 
-    # 12) 相对基线的逐条总分差值分布
-    ax12 = fig.add_subplot(4, 4, 12)
+    # 5) 相对基线的逐条总分差值分布（配对差值，看提升幅度而非只看胜负）
+    ax12 = fig.add_subplot(gs[1, 0])
+    base_totals = totals[baseline]  # 原"逐条散点"面板已删，基线序列在此处仍被 ⑤ 使用
     bins12 = np.linspace(-1, 1, 41)
     for i in others:
         deltas = [totals[i][t] - base_totals[t] for t in range(n_common)]
-        ax12.hist(deltas, bins=bins12, alpha=0.6, label=f"{labels[i]} - {labels[baseline]}",
-                  color=colors[i])
+        ax12.hist(deltas, bins=bins12, alpha=0.6, label=labels[i], color=colors[i])
     ax12.axvline(0, color="black", linewidth=0.8)
     ax12.set_xlabel("Δ总分")
     ax12.set_ylabel("样本数")
-    ax12.set_title(f"⑫ Δ总分分布（正=优于 {labels[baseline]}）")
-    ax12.legend(fontsize=7)
+    ax12.set_title(f"⑤ Δ总分分布（Δ = 本曲线 − {labels[baseline]}，正=更好）")
+    legend_compact(ax12, 2, "upper right")
     ax12.grid(axis="y", alpha=0.3)
 
-    # 13) 仅结构合格样本（json_valid≥0.5）的语义维度对比：剥离"格式崩掉"的影响
-    ax13 = fig.add_subplot(4, 4, 13)
+    # 7) 仅结构合格样本（json_valid≥0.5）的语义维度对比：剥离"格式崩掉"的影响
+    ax13 = fig.add_subplot(gs[1, 2])
     valid_rows = [[r for r in rows if r["json_valid"] >= 0.5] for rows in aligned]
     sem_keys = ["memory_precision", "memory_recall", "speaker_attribution",
                 "summary_score", "intent_score", "other"]
     x13 = np.arange(len(sem_keys))
     sem_means = [[mean_over_applicable([dim_value(r, k) for r in rows]) for k in sem_keys]
                  for rows in valid_rows]
-    grouped_bars(ax13, x13, sem_means, labels, ylim=1.05)
+    grouped_bars(ax13, x13, sem_means, labels, ylim=1.35)
     ax13.set_xticks(x13)
     ax13.set_xticklabels([name for k, name in DIMENSIONS if k in sem_keys],
                          rotation=30, ha="right", fontsize=8)
     ax13.set_ylabel("均值")
     counts13 = "/".join(str(len(rows)) for rows in valid_rows)
-    ax13.set_title(f"⑬ 结构合格样本的语义维度（样本数 {counts13}）")
-    ax13.legend(fontsize=7)
+    ax13.set_title(f"⑦ 结构合格样本的语义维度（样本数 {counts13}）")
+    legend_compact(ax13, 5)
     ax13.grid(axis="y", alpha=0.3)
 
-    # 14) 维度适用率热力图（None 占比 → 1-适用率；空记忆样本会拉低适用率）
-    ax14 = fig.add_subplot(4, 4, 14)
+    # 8) 维度适用率热力图（None 占比 → 1-适用率；空记忆样本会拉低适用率）
+    ax14 = fig.add_subplot(gs[1, 3])
     applicable = np.array([
         [sum(1 for r in rows if dim_value(r, k) is not None) / len(rows) for k in OPTIONAL_DIMS]
         for rows in aligned
@@ -425,11 +389,11 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         for j in range(len(OPTIONAL_DIMS)):
             ax14.text(j, i, f"{applicable[i, j]:.2f}", ha="center", va="center",
                       fontsize=8, color="white" if applicable[i, j] < 0.6 else "black")
-    ax14.set_title("⑭ 维度适用率（越高=越多样本有判定依据）")
+    ax14.set_title("⑧ 维度适用率（越高=越多样本有判定依据）")
     fig.colorbar(im14, ax=ax14, fraction=0.046)
 
-    # 15) 全量口径汇总表（各自全部样本，非对齐）
-    ax15 = fig.add_subplot(4, 4, 15)
+    # 9) 全量口径汇总表（各自全部样本，非对齐）
+    ax15 = fig.add_subplot(gs[2, 0])
     ax15.axis("off")
     table_metrics = [
         ("n", lambda rs: f"{len(rs)}"),
@@ -449,32 +413,39 @@ def render(series: list[dict], labels: list[str], aligned: list[list[dict]],
         ("证据均值↑", lambda rs: f"{mean_over_applicable([dim_value(r, 'grounding_mean') for r in rs]):.3f}"),
     ]
     cell_text = [[fn(s["rows"]) for s in series] for _, fn in table_metrics]
+    # 表头列宽有限：过长的曲线名（如 "teacher(Grok4.3) 上限"）在首个空格处折行，避免压到相邻列
+    col_headers = [lb.replace(" ", "\n", 1) if len(lb) > 12 else lb for lb in labels]
     table = ax15.table(cellText=cell_text,
                        rowLabels=[name for name, _ in table_metrics],
-                       colLabels=labels,
+                       colLabels=col_headers,
                        cellLoc="center", loc="center")
     table.auto_set_font_size(False)
     table.set_fontsize(7.5)
     table.scale(1.0, 1.15)
-    ax15.set_title("⑮ 全量口径汇总（各曲线自己的全部样本）", fontsize=10)
+    ax15.set_title("⑨ 全量口径汇总（各曲线自己的全部样本）", fontsize=10)
 
-    # 16) 口径与读图说明
-    ax16 = fig.add_subplot(4, 4, 16)
+    # 10) 口径与读图说明（跨 3 列加宽，长文本一行放得下；不再指定 monospace —— 该族缺汉字字形会出方块）
+    ax16 = fig.add_subplot(gs[2, 1:4])
     ax16.axis("off")
+    # 截断与结构无效的关系按当前数据现算，避免说明文字里的数字随数据变化而过期
+    trunc_str = " / ".join(f"{lb} {trunc_rate(rows) * 100:.1f}%" for lb, rows in zip(labels, aligned))
+    json0_gap = max(abs(json_share(rows, 0.0) - trunc_rate(rows)) for rows in aligned)
     notes = [
         "口径：prompt 内嵌任务指令 + response_format json_schema(strict) + temperature=1.0",
-        "评分：L1 规则(json_valid 四档) + L2 语义（记忆 P/R、归因、幻觉、摘要、意图、其它）加权",
-        "权重：记忆P .18 / 记忆R .18 / 归因 .14 / 摘要 .15 / 意图 .10 / JSON .10 / 幻觉 .08 / 其它 .07",
+        "评分：L1 规则（json_valid 四档）+ L2 语义加权，总分 = Σ(权重 × 分项)，权重如下（合计 1.00）：",
+        "      记忆P 0.18 / 记忆R 0.18 / 归因 0.14 / 摘要 0.15 / 意图 0.10 / JSON 0.10 / 幻觉 0.08（= 1 - 幻觉率）/ 其它 0.07",
         "None 语义：该维度无判定依据时剔除并重新归一化权重（不是按 0 计）",
-        f"对齐：1~14 面板仅用公共前缀 n={n_common}；⑮ 用各自全量样本，两者不可混读",
-        "方向：幻觉惩罚↓、grounding 证据均值↑；⑪ 已把幻觉取补，统一为“正=更好”",
-        "截断：finish_reason=length 按调用失败降级（评分全 0），是本流程唯一残余失败模式",
-        "读图重点：先看 ⑤/⑦ 结构层（能否稳定产出结构），再看 ⑬ 语义层（真变聪明了吗）",
+        f"对齐：①~⑧ 面板仅用公共前缀 n={n_common}；⑨ 用各自全部样本，两者不可混读",
+        "方向：幻觉惩罚↓、grounding 证据均值↑；⑥ 已把幻觉取补，统一为“正=更好”",
+        "读图重点：先看 ③ 结构层（能否稳定产出结构），再看 ⑦ 语义层（剥离“格式崩掉”后是否真的更聪明）",
+        "teacher 上限：线上 Grok 4.3 的输出自评（非本模型），代表蒸馏目标的可达上界，与它的差距即剩余学习空间",
+        f"截断发现：json_valid=0 占比与截断率几乎同一件事（最大偏差 {json0_gap * 100:.2f} 个百分点）；截断率 {trunc_str} ——",
+        "          即结构分全丢的样本基本全来自 finish_reason=length，不存在“格式跑偏但没截断”的失败，故原“L1 断言率”“关键指标”两面板已删（信息全在 ③ 内）。",
         "",
-        "可比性提醒：基础模型若未施加结构化输出约束，其 json_valid 与 L2 分数会被",
-        "“解析失败→全 0”主导，与训练后模型不是同一口径；此时应以 ⑬（结构合格子集）为准。",
+        "可比性提醒：基础模型若未施加结构化输出约束，其 json_valid 与 L2 分数会被“解析失败→全 0”主导，与训练后模型不是同一口径；",
+        "              此时应以 ⑦（仅 json_valid≥0.5 的结构合格子集）为准，它与 ③ 的绿档高度一致。",
     ]
-    ax16.text(0.0, 0.98, "\n".join(notes), va="top", ha="left", fontsize=8.5, family="monospace")
+    ax16.text(0.0, 0.98, "\n".join(notes), va="top", ha="left", fontsize=9)
 
     fig.tight_layout(rect=(0, 0, 1, 0.955))
     fig.savefig(args.out, dpi=130)

@@ -1,11 +1,11 @@
 # @author: ztwz
-"""多模型 1000 条评测编排：基座 2B/4B 各自起 vLLM 串行评测，smoke/10k 复用已有 dump
-（模型输出）但用**当前评分器版本**重新打分，最后汇总渲染对比图并补打观测。
+"""多模型 1000 条评测编排：基座 2B/4B 各自起 vLLM 串行评测，smoke(1k)/10k/teacher 复用已有
+dump（模型输出）但用**当前评分器版本**重新打分，最后汇总渲染对比图并补打观测。
 
 设计（口径与性能取舍）：
 - 基座 2B/4B 走 vLLM 后端；生成阶段 vLLM 独占 GPU，打分阶段停掉 vLLM 再用 cuda
   （避免 embedding 与推理抢显存）；
-- smoke-2B / lora-10k 的**模型输出（dump）不再重新生成**，但分数文件必须用当前评分器
+- smoke-1k / lora-10k / teacher（线上 Grok 4.3）的**模型输出（dump）不再重新生成**，但分数文件必须用当前评分器
   重打——评分权重曾有变更（intent 0.5/0.2/0.3 → 0.8/0.1/0.1），旧 scores 与本次基座
   口径不一致，直接复用会破坏对比（plot_eval_compare 要求同一评分器版本）；
 - 观测文件（--dump-observations 产物）在重打分阶段一并产出。
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import socket
 import subprocess
 import sys
@@ -41,12 +42,14 @@ BASE_MODELS = [
     {"label": "base_4b", "name": "Qwen/Qwen3.5-4B", "served": "Qwen3.5-4B"},
 ]
 
-# 对比图曲线顺序：基础 2B → 基础 4B → smoke → 10k-lora
+# 对比图曲线顺序：基础 2B → 基础 4B → 1k-lora → 10k-lora → teacher（线上 Grok 4.3）上限
+# 文件名沿用 smoke_/lora_（对应 --smoke-dump/--lora-dump 产物），仅改图例展示名
 SERIES_DEF = [
     ("基础 2B", "base_2b_scores.jsonl"),
     ("基础 4B", "base_4b_scores.jsonl"),
-    ("蒸馏 smoke", "smoke_scores.jsonl"),
+    ("蒸馏 1k-lora", "smoke_scores.jsonl"),
     ("蒸馏 10k-lora", "lora_scores.jsonl"),
+    ("teacher(Grok4.3) 上限", "teacher_scores.jsonl"),
 ]
 
 
@@ -163,6 +166,8 @@ def parse_args() -> argparse.Namespace:
                    help="smoke-2B 已有模型输出 dump（复用，不重新生成）")
     p.add_argument("--lora-dump", default="data/tmp_students_10k.jsonl",
                    help="10k-lora 已有模型输出 dump（复用，不重新生成）")
+    p.add_argument("--teacher-dump", default="data/tmp_teacher_oracle.jsonl",
+                   help="teacher（线上 Grok 4.3）已有输出 dump（复用，不重新生成；与基座 dump 同源同序）")
     p.add_argument("--out-dir", default="data/compare")
     p.add_argument("--vllm-venv", default="/workspace/.venv-vllm")
     p.add_argument("--train-venv", default="/workspace/.venv-train")
@@ -208,10 +213,10 @@ def main() -> None:
 
     print("评分口径：intent 0.8/0.1/0.1（当前版本），smoke/10k 将按此口径重打", flush=True)
 
-    # 1) smoke / 10k 复用已有模型输出（dump），用当前评分器重新打分
+    # 1) smoke(1k) / 10k / teacher 复用已有模型输出（dump），用当前评分器重新打分
     #    10k-lora 顺带产出低分观测（新权重下低分判定会变化，观测需同步重打）
     obs_path = args.out_dir / "lora_obs_high_risk.jsonl"
-    for key in ("smoke", "lora"):
+    for key in ("smoke", "lora", "teacher"):
         dump = Path(getattr(args, f"{key}_dump"))
         scores = args.out_dir / f"{key}_scores.jsonl"
         extra_obs = obs_path if key == "lora" else None
@@ -236,14 +241,16 @@ def main() -> None:
     for name, file in SERIES_DEF:
         path = args.out_dir / file
         if path.exists():
-            series_args += ["--series", f"{name}={path}"]
-    if len(series_args) < 4:
-        print("警告：曲线的分数文件不足 4 条，输出图将缺少部分序列", flush=True)
+            # 标签含空格（"基础 2B"），必须按 shell 规则引用，否则 LABEL=PATH 会被空格拆开
+            series_args += ["--series", shlex.quote(f"{name}={path}")]
+    n_series = len(series_args) // 2  # 每条曲线占 2 个 token：--series + LABEL=PATH
+    if n_series < len(SERIES_DEF):
+        print(f"警告：曲线分数文件只有 {n_series}/{len(SERIES_DEF)} 条，输出图将缺少部分序列", flush=True)
     plot = sh(
         f"{args.train_venv}/bin/python scripts/plot_eval_compare.py "
         f"{' '.join(series_args)} "
-        f"--baseline 0 --title {json.dumps(args.title)} "
-        f"--out {args.out_dir / 'compare_all.png'}"
+        f"--baseline 0 --title {shlex.quote(args.title)} "
+        f"--out {shlex.quote(str(args.out_dir / 'compare_all.png'))}"
     )
     if plot:
         print(f"\n对比图已保存：{args.out_dir / 'compare_all.png'}", flush=True)
