@@ -61,10 +61,13 @@ def parse_args() -> argparse.Namespace:
     # 训练超参
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--max-steps", type=int, default=-1, help=">0 时覆盖 epochs（冒烟测试用）")
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="从 checkpoint 目录续训（如 models/lora_2b/checkpoint-4545）。"
+                        "配 --epochs N 会按新 max_steps 重造余弦周期，LR 自恢复点接续（无需改 --lr）")
     p.add_argument("--max-seq-len", type=int, default=12288)
     p.add_argument("--lr", type=float, default=2e-4, help="LoRA 可比全参微调高一个量级")
     p.add_argument("--batch-size", type=int, default=8,
-                   help="每设备 batch：A10 23G 下 2B 的 LoRA 用 8 仍有余量，且能喂满算力（旧默认 2=显存只用到 ~20%）")
+                   help="每设备 batch：A10 23G 下 2B 的 LoRA 用 8 仍有余量，且能喂满算力（旧默认 2=显存只用到 ~20%%）")
     p.add_argument("--grad-accum", type=int, default=1,
                    help="梯度累积步数，与 --batch-size 乘积 = global batch（默认 = 8 × 1）")
     p.add_argument("--lora-r", type=int, default=16)
@@ -423,54 +426,57 @@ def main() -> None:
                 print(f"警告：无法补回 {length_column_name!r} 列（{exc}），"
                       f"已回退随机采样（padding 浪费偏大，但不影响训练正确性）", flush=True)
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     train_minutes = (time.time() - started_all) / 60
     print(f"训练完成，用时 {train_minutes:.1f} 分钟", flush=True)
 
-    model.save_pretrained(args.out_dir)
-    text_tokenizer.save_pretrained(args.out_dir)
-    print(f"LoRA 适配器已保存：{args.out_dir}", flush=True)
+    # 多卡 DDP：只有 rank0 落盘/评测/合并；rank1 直接结束（torchrun 会等所有 rank 退出）
+    if trainer.is_world_process_zero():
+        model.save_pretrained(args.out_dir)
+        text_tokenizer.save_pretrained(args.out_dir)
+        print(f"LoRA 适配器已保存：{args.out_dir}", flush=True)
 
-    holdout = eval_on_holdout(model, text_tokenizer, args)
-    plot_results(trainer, holdout, Path(args.out_dir))
+        holdout = eval_on_holdout(model, text_tokenizer, args)
+        plot_results(trainer, holdout, Path(args.out_dir))
 
-    # 训练配置与统计落盘，保证可复现（含数据规模、序列分布、超参、留出集分数）
-    run_info = {
-        "model": args.model,
-        "train_file": args.train_file,
-        "n_records": len(records),
-        "seq_stats": seq_stats,
-        "trainable_params": trainable,
-        "hyperparams": {
-            "epochs": args.epochs, "max_steps": args.max_steps, "lr": args.lr,
-            "batch_size": args.batch_size, "grad_accum": args.grad_accum,
-            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": use_rslora,
-            "neftune_alpha": args.neftune_alpha, "lr_scheduler": args.lr_scheduler,
-            "warmup_ratio": args.warmup_ratio, "group_by_length": args.group_by_length,
-            "sampling_strategy": sampling_strategy,
-            "seed": args.seed,
-        },
-        "train_minutes": round(train_minutes, 1),
-        "holdout_scores": holdout,
-        # 评测口径一并落盘，保证分数可解释（对齐线上：user-only、temperature=1.0）
-        "holdout_eval_config": {
-            "file": args.eval_file,
-            "limit": args.eval_limit,
-            "temperature": args.eval_temperature,
-            "max_new_tokens": args.eval_max_new_tokens,
-            "system_prompt": False,
-            "response_schema": None,
-            "seed": args.seed,
-        },
-    }
-    Path(args.out_dir, "train_run.json").write_text(
-        json.dumps(run_info, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print(f"训练记录已保存：{args.out_dir}/train_run.json", flush=True)
+        # 训练配置与统计落盘，保证可复现（含数据规模、序列分布、超参、留出集分数）
+        run_info = {
+            "model": args.model,
+            "train_file": args.train_file,
+            "n_records": len(records),
+            "seq_stats": seq_stats,
+            "trainable_params": trainable,
+            "hyperparams": {
+                "epochs": args.epochs, "max_steps": args.max_steps, "lr": args.lr,
+                "batch_size": args.batch_size, "grad_accum": args.grad_accum,
+                "lora_r": args.lora_r, "lora_alpha": args.lora_alpha, "use_rslora": use_rslora,
+                "neftune_alpha": args.neftune_alpha, "lr_scheduler": args.lr_scheduler,
+                "warmup_ratio": args.warmup_ratio, "group_by_length": args.group_by_length,
+                "sampling_strategy": sampling_strategy,
+                "resume_from_checkpoint": args.resume_from_checkpoint,
+                "seed": args.seed,
+            },
+            "train_minutes": round(train_minutes, 1),
+            "holdout_scores": holdout,
+            # 评测口径一并落盘，保证分数可解释（对齐线上：user-only、temperature=1.0）
+            "holdout_eval_config": {
+                "file": args.eval_file,
+                "limit": args.eval_limit,
+                "temperature": args.eval_temperature,
+                "max_new_tokens": args.eval_max_new_tokens,
+                "system_prompt": False,
+                "response_schema": None,
+                "seed": args.seed,
+            },
+        }
+        Path(args.out_dir, "train_run.json").write_text(
+            json.dumps(run_info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"训练记录已保存：{args.out_dir}/train_run.json", flush=True)
 
-    if args.merged_dir:
-        model.save_pretrained_merged(args.merged_dir, text_tokenizer, save_method="merged_16bit")
-        print(f"合并权重已保存：{args.merged_dir}", flush=True)
+        if args.merged_dir:
+            model.save_pretrained_merged(args.merged_dir, text_tokenizer, save_method="merged_16bit")
+            print(f"合并权重已保存：{args.merged_dir}", flush=True)
 
 
 if __name__ == "__main__":
